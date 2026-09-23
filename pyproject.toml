@@ -34,6 +34,7 @@ science = [
 ]
 ml = [
     "torch>=2.2",
+    "diffusers>=0.30",
     "scikit-learn>=1.4",
     "jax>=0.4",
 ]
@@ -42,6 +43,8 @@ dev = [
     "pytest-benchmark>=4.0",
     "ruff>=0.4",
     "mypy>=1.10",
+    "types-PyYAML>=6.0",
+    "scipy-stubs>=1.14",
     "jupyterlab>=4.1",
     "py-spy>=0.3",
     "scalene>=1.5",
@@ -59,7 +62,7 @@ select = ["E", "F", "I", "UP", "B", "NPY"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
 
 [tool.pytest.ini_options]

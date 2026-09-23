@@ -164,7 +164,7 @@ class PlanetParams:
     @property
     def day_length(self) -> float:
         """自转周期（小时）。"""
-        return angular_velocity_to_day_length(self.rotation_rate)
+        return float(angular_velocity_to_day_length(self.rotation_rate))
 
     @property
     def equatorial_radius(self) -> float:

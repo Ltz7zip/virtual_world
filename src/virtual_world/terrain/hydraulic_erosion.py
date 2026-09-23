@@ -181,7 +181,7 @@ def _advect_pass(
 ) -> None:
     """半拉格朗日单次对流：``sign=-1`` 反向回溯（求 ``s'``），``sign=+1`` 正向。"""
     nlat, nlon = field.shape
-    for i in prange(nlat):
+    for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
         for j in range(nlon):
             if not land[i, j]:
                 out[i, j] = 0.0
@@ -208,7 +208,7 @@ def _apply_macormack(
 ) -> None:
     """MacCormack 校正 + 局部极值限制（§5.3）。"""
     nlat, nlon = field.shape
-    for i in prange(nlat):
+    for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
         for j in range(nlon):
             if not land[i, j]:
                 out[i, j] = 0.0
@@ -328,12 +328,12 @@ def _hydraulic_loop(
     dt = dt0
     for _ in range(n_steps):
         # 1 降水补给
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 if land[i, j]:
                     depth[i, j] += precip[i, j] * dt
         # 2 管道流量（每个面只由西/南侧单元计算一次，符号表示净输运方向）
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 f_east[i, j] = 0.0
                 f_north[i, j] = 0.0
@@ -351,7 +351,7 @@ def _hydraulic_loop(
                     face = 0.5 * dlat_m * (dlon_m[i] + dlon_m[i + 1])
                     f_north[i, j] = pipe_coeff * face * np.sign(dh_n) * np.sqrt(abs(dh_n))
         # 3 出流钳制因子：保证本步排水量不超过现有水量
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 scale[i, j] = 1.0
                 if not land[i, j]:
@@ -373,7 +373,7 @@ def _hydraulic_loop(
                     if limit < 1.0:
                         scale[i, j] = limit
         # 4 面通量按失水方的因子缩放（仍是两侧共享，守恒不破坏）
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 jn = j + 1
                 if jn >= nlon:
@@ -389,7 +389,7 @@ def _hydraulic_loop(
                 elif fn < 0.0 and i + 1 < nlat:
                     f_north[i, j] = fn * scale[i + 1, j]
         # 5 水量更新
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 if not land[i, j]:
                     depth[i, j] = 0.0
@@ -404,7 +404,7 @@ def _hydraulic_loop(
                 if depth[i, j] < 0.0:
                     depth[i, j] = 0.0
         # 6 流速场（净流量 / (水深 × 面宽)，并施加流速上限）
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 vx[i, j] = 0.0
                 vy[i, j] = 0.0
@@ -433,7 +433,7 @@ def _hydraulic_loop(
                 vy[i, j] = uy
                 speed[i, j] = sp
         # 7 侵蚀/沉积（算增量再统一应用，避免并行读写竞态）
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 delta_h[i, j] = 0.0
                 delta_s[i, j] = 0.0
@@ -479,7 +479,7 @@ def _hydraulic_loop(
                     delta_h[i, j] = -transfer
                     delta_s[i, j] = transfer
         # 8 应用地形与悬移质增量
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 if not land[i, j]:
                     continue
@@ -491,7 +491,7 @@ def _hydraulic_loop(
         _advect_pass(sediment, s1, adv_lo, adv_hi, vx, vy, -1.0, dt, dlat_m, dlon_m, land)
         if macormack:
             _advect_pass(s1, s2, tmp_a, tmp_b, vx, vy, 1.0, dt, dlat_m, dlon_m, land)
-            for i in prange(nlat):
+            for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
                 for j in range(nlon):
                     if not land[i, j]:
                         sediment[i, j] = 0.0
@@ -505,7 +505,7 @@ def _hydraulic_loop(
                         value = 0.0
                     sediment[i, j] = value
         else:
-            for i in prange(nlat):
+            for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
                 for j in range(nlon):
                     sediment[i, j] = s1[i, j] if land[i, j] else 0.0
         # 10 自适应时间步（用上一步流速场估计）

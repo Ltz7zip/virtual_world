@@ -63,7 +63,7 @@ def _thermal_loop(
 
     for _ in range(iterations):
         # 1 面通量（每个面只计算一次；符号 = 由 i 侧流向 i+1 侧为正）
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 f_east[i, j] = 0.0
                 f_north[i, j] = 0.0
@@ -88,7 +88,7 @@ def _thermal_loop(
                     elif dh_n < -limit_n:
                         f_north[i, j] = -rate * (-dh_n - limit_n) * face_n
         # 2 出流钳制：一次迭代转移量不得超过"到最低邻居的余量"
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 scale[i, j] = 1.0
                 if not land[i, j]:
@@ -123,7 +123,7 @@ def _thermal_loop(
                     if limit < 1.0:
                         scale[i, j] = limit
         # 3 按失水方缩放面通量
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 jn = j + 1
                 if jn >= nlon:
@@ -139,7 +139,7 @@ def _thermal_loop(
                 elif fn < 0.0 and i + 1 < nlat:
                     f_north[i, j] = fn * scale[i + 1, j]
         # 4 地形更新（面通量两侧共享 → 体积守恒）
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 if not land[i, j]:
                     continue
@@ -241,7 +241,7 @@ def _diffusion_loop(
     f_east = np.zeros((nlat, nlon), dtype=np.float64)
     f_north = np.zeros((nlat, nlon), dtype=np.float64)
     for _ in range(n_steps):
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 f_east[i, j] = 0.0
                 f_north[i, j] = 0.0
@@ -255,7 +255,7 @@ def _diffusion_loop(
                 if i + 1 < nlat and land[i + 1, j]:
                     face_n = 0.5 * dlat_m * (dlon_m[i] + dlon_m[i + 1])
                     f_north[i, j] = kappa * dt * (height[i, j] - height[i + 1, j]) / dlat_m * face_n
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 if not land[i, j]:
                     continue
@@ -296,7 +296,7 @@ def _nonlinear_diffusion_loop(
     f_east = np.zeros((nlat, nlon), dtype=np.float64)
     f_north = np.zeros((nlat, nlon), dtype=np.float64)
     for _ in range(n_steps):
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 f_east[i, j] = 0.0
                 f_north[i, j] = 0.0
@@ -333,7 +333,7 @@ def _nonlinear_diffusion_loop(
                         if abs(flux_n) > cap_n:
                             flux_n = cap_n if flux_n > 0.0 else -cap_n
                     f_north[i, j] = flux_n
-        for i in prange(nlat):
+        for i in prange(nlat):  # type: ignore[no-untyped-call, attr-defined]
             for j in range(nlon):
                 if not land[i, j]:
                     continue

@@ -246,7 +246,8 @@ def haversine_distance(
     dphi = phi2 - phi1
     dlam = np.deg2rad(lon2 - lon1)
     a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2.0) ** 2
-    return 2.0 * radius * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+    distance: np.ndarray = 2.0 * radius * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+    return distance
 
 
 def latlon_to_xyz(lat_deg: Any, lon_deg: Any, radius: float) -> np.ndarray:

@@ -12,6 +12,9 @@ from typing import Any
 
 import numpy as np
 
+#: MLX 模块（不可用时为 ``None``）；显式标注使导入失败分支可赋 None
+mx: Any
+
 try:  # pragma: no cover - 取决于平台
     import mlx.core as mx
 

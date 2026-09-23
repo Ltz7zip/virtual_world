@@ -19,8 +19,8 @@ import heapq
 from collections import deque
 
 import numpy as np
-from scipy import sparse  # type: ignore[import-untyped]
-from scipy.sparse import csgraph  # type: ignore[import-untyped]
+from scipy import sparse
+from scipy.sparse import csgraph
 
 from ..core.cubed_sphere import CubedSphere
 

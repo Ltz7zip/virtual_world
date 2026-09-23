@@ -13,6 +13,7 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
 
 from .core.grid import GridState, get_resolution_level
 from .core.planet import PlanetParams, list_presets
@@ -99,7 +100,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     planet = PlanetParams.from_preset(args.planet)
     rows: list[tuple[str, float]] = []
 
-    def bench(name: str, fn, iters: int = 5) -> None:
+    def bench(name: str, fn: Callable[[], object], iters: int = 5) -> None:
         fn()  # 预热
         t0 = time.perf_counter()
         for _ in range(iters):
@@ -148,7 +149,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    func: Callable[[argparse.Namespace], int] = args.func
+    return func(args)
 
 
 if __name__ == "__main__":

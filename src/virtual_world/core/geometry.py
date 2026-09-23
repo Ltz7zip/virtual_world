@@ -208,12 +208,12 @@ class LatLonGeometry(GridGeometry):
     @property
     def lat(self) -> np.ndarray:
         """纬度中心轴（度，升序）。"""
-        return self._lat  # type: ignore[attr-defined]
+        return self._lat  # type: ignore[attr-defined, no-any-return]
 
     @property
     def lon(self) -> np.ndarray:
         """经度中心轴（度，升序）。"""
-        return self._lon  # type: ignore[attr-defined]
+        return self._lon  # type: ignore[attr-defined, no-any-return]
 
     # ===== 元数据 =====
 
@@ -375,7 +375,7 @@ class LatLonGeometry(GridGeometry):
 
 def _coords_from_edges(edges: np.ndarray) -> np.ndarray:
     """由格边求格心（面积一致的分块中心）。"""
-    return 0.5 * (edges[:-1] + edges[1:])
+    return np.asarray(0.5 * (edges[:-1] + edges[1:]))
 
 
 # ===== 立方球网格 =====

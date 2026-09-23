@@ -58,23 +58,28 @@ class DeterministicRNG:
 
     def random(self, size: int | tuple[int, ...] | None = None) -> np.ndarray:
         """[0, 1) 均匀分布。"""
-        return self.rng.random(size)
+        # numpy 在 size=None 时返回标量，此处统一归一化为数组（与返回标注一致）
+        return np.asarray(self.rng.random(size))
 
     def uniform(self, low: Any = 0.0, high: Any = 1.0, size: Any = None) -> np.ndarray:
         """均匀分布。"""
-        return self.rng.uniform(low, high, size)
+        values: np.ndarray = self.rng.uniform(low, high, size)
+        return values
 
     def normal(self, loc: Any = 0.0, scale: Any = 1.0, size: Any = None) -> np.ndarray:
         """正态分布。"""
-        return self.rng.normal(loc, scale, size)
+        values: np.ndarray = self.rng.normal(loc, scale, size)
+        return values
 
     def integers(self, low: Any, high: Any = None, size: Any = None) -> np.ndarray:
         """整数分布。"""
-        return self.rng.integers(low, high, size)
+        values: np.ndarray = self.rng.integers(low, high, size)
+        return values
 
     def choice(self, a: Any, size: Any = None, replace: bool = True, p: Any = None) -> np.ndarray:
         """离散抽样。"""
-        return self.rng.choice(a, size=size, replace=replace, p=p)
+        values: np.ndarray = self.rng.choice(a, size=size, replace=replace, p=p)
+        return values
 
     def __repr__(self) -> str:
         return f"DeterministicRNG(seed={self.seed}, name={self.name!r})"

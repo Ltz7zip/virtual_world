@@ -225,10 +225,8 @@ class TangentStencil:
             cos_t = np.cos(theta)[..., None]
             sin_t = np.sin(theta)[..., None]
             dot = np.sum(axis * vector, axis=-1, keepdims=True)
-            return (
-                vector * cos_t
-                + np.cross(axis, vector) * sin_t
-                + axis * dot * (1.0 - cos_t)
+            return np.asarray(
+                vector * cos_t + np.cross(axis, vector) * sin_t + axis * dot * (1.0 - cos_t)
             )
 
         moved_east = rotate(east_k)
@@ -349,8 +347,8 @@ class LocalInterpolator:
     """
 
     def __init__(self, centers: np.ndarray, k: int = DEFAULT_K, radius: float = 1.0) -> None:
-        from scipy.spatial import (
-            cKDTree,  # type: ignore[import-untyped]  # 延迟导入，保持 core 轻量
+        from scipy.spatial import (  # 延迟导入，保持 core 轻量
+            cKDTree,
         )
 
         centers = np.asarray(centers, dtype=np.float64)

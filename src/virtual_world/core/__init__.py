@@ -65,6 +65,7 @@ __all__ = [
     "list_presets",
     "load_resolution_levels",
     "make_geometry",
+    "operators",
     "spherical",
     "units",
 ]

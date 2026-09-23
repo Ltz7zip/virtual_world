@@ -28,7 +28,7 @@ from functools import lru_cache
 from typing import Any
 
 import numpy as np
-from scipy.spatial import cKDTree  # type: ignore[import-untyped]
+from scipy.spatial import cKDTree
 
 from . import operators, spherical
 from .constants import EARTH_RADIUS
@@ -83,7 +83,7 @@ def _spherical_triangle_area(a: np.ndarray, b: np.ndarray, c: np.ndarray, radius
         "...i,...i->...", c, a
     )
     excess = 2.0 * np.arctan2(numerator, denominator)
-    return radius**2 * excess
+    return np.asarray(radius**2 * excess)
 
 
 def _band_count(resolution_deg: float) -> int:
@@ -301,7 +301,7 @@ class CubedSphere:
         u = self._to_cube(s_j) * np.ones((6, n, n))
         v = self._to_cube(s_i) * np.ones((6, n, n))
         target, i, j = self._lookup(faces, u, v)
-        return (target * (n * n) + i * n + j).astype(np.int64)
+        return np.asarray((target * (n * n) + i * n + j).astype(np.int64))
 
     def neighbors(self) -> np.ndarray:
         """4-邻域扁平索引，形状 ``(4, 6*n*n)``，顺序见 :data:`DIRECTIONS`（历史 API）。"""

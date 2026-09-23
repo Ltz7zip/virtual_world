@@ -183,7 +183,8 @@ def _nside_for_resolution(resolution_deg: float) -> int:
     import math
 
     target = math.sqrt((4.0 * math.pi) / math.radians(max(resolution_deg, 1e-6)) ** 2 / 12.0)
-    return max(1, 2 ** max(0, int(round(math.log2(max(target, 1.0))))))
+    nside: int = max(1, 2 ** max(0, int(round(math.log2(max(target, 1.0))))))
+    return nside
 
 
 @dataclass(frozen=True)
@@ -442,7 +443,7 @@ class GridState:
     @staticmethod
     def _coords_from_edges(edges: np.ndarray) -> np.ndarray:
         """由格边求格心（面积一致的分块中心）。"""
-        return 0.5 * (edges[:-1] + edges[1:])
+        return np.asarray(0.5 * (edges[:-1] + edges[1:]))
 
     def _like(self, **overrides: Any) -> GridState:
         """复制元数据构造一个新网格（网格参数可按需覆盖）。"""
@@ -690,12 +691,13 @@ class GridState:
 
     def nearest_index(self, lat: float, lon: float) -> tuple[int, int]:
         """返回最接近给定经纬度的网格索引 ``(i, j)``（仅经纬网格）。"""
-        if self.grid_type != "latlon":
+        lat_axis, lon_axis = self.lat, self.lon
+        if self.grid_type != "latlon" or lat_axis is None or lon_axis is None:
             raise NotImplementedError(
                 f"{self.grid_type} 网格没有 (i, j) 语义，请用 cell_index() 或 value_at()"
             )
-        i = int(np.argmin(np.abs(self.lat - lat)))
-        j = int(np.argmin(np.abs(((self.lon - lon + 180.0) % 360.0) - 180.0)))
+        i = int(np.argmin(np.abs(lat_axis - lat)))
+        j = int(np.argmin(np.abs(((lon_axis - lon + 180.0) % 360.0) - 180.0)))
         return i, j
 
     def cell_index(self, lat: float, lon: float) -> int:
@@ -769,13 +771,14 @@ class GridState:
 
         极点/日期线上的接缝处经度不再单调，区域网格不适合再做经向差分。
         """
-        if self.grid_type != "latlon":
+        lat_axis, lon_axis = self.lat, self.lon
+        if self.grid_type != "latlon" or lat_axis is None or lon_axis is None:
             raise NotImplementedError(
                 f"{self.grid_type} 网格不支持矩形区域切片（无规则经纬索引）；"
                 "可先用 regrid('latlon') 转换"
             )
-        i0 = int(np.searchsorted(self.lat, lat_min, side="left"))
-        i1 = int(np.searchsorted(self.lat, lat_max, side="right"))
+        i0 = int(np.searchsorted(lat_axis, lat_min, side="left"))
+        i1 = int(np.searchsorted(lat_axis, lat_max, side="right"))
         if i1 <= i0:
             raise ValueError(f"纬度范围 [{lat_min}, {lat_max}] 未覆盖任何网格点")
 
@@ -791,8 +794,8 @@ class GridState:
             nlat=lat_idx.size,
             nlon=count,
             resolution=self.resolution,
-            lat=self.lat[lat_idx],
-            lon=self.lon[j_idx],
+            lat=lat_axis[lat_idx],
+            lon=lon_axis[j_idx],
         )
         for name in FIELDS:
             value = getattr(self, name)
@@ -846,9 +849,11 @@ class GridState:
         if self.nlat % factor or self.nlon % factor:
             raise ValueError(f"factor={factor} 必须同时整除 nlat={self.nlat} 与 nlon={self.nlon}")
         coarse_geometry = self.geometry.coarsen_geometry(factor)
+        # latlon 粗化后的几何仍是经纬网格
+        assert isinstance(coarse_geometry, geometry_module.LatLonGeometry)
         result = self._like(
-            nlat=coarse_geometry.nlat,  # type: ignore[attr-defined]
-            nlon=coarse_geometry.nlon,  # type: ignore[attr-defined]
+            nlat=coarse_geometry.nlat,
+            nlon=coarse_geometry.nlon,
             resolution=self.resolution * factor,
             lat=coarse_geometry.lat,
             lon=coarse_geometry.lon,
@@ -892,19 +897,22 @@ class GridState:
             return self.copy()
 
         xp = self._xp
-        lat_edges2 = np.linspace(self.lat_edges[0], self.lat_edges[-1], nlat + 1)
-        lon_edges2 = np.linspace(self.lon_edges[0], self.lon_edges[-1], nlon + 1)
+        lat_edges, lon_edges = self.lat_edges, self.lon_edges
+        # latlon 网格在 __post_init__ 中解析出格边，必然非 None
+        assert lat_edges is not None and lon_edges is not None
+        lat_edges2 = np.linspace(lat_edges[0], lat_edges[-1], nlat + 1)
+        lon_edges2 = np.linspace(lon_edges[0], lon_edges[-1], nlon + 1)
         new_lat = self._coords_from_edges(lat_edges2)
         new_lon = self._coords_from_edges(lon_edges2)
-        resolution = float((self.lat_edges[-1] - self.lat_edges[0]) / nlat)
+        resolution = float((lat_edges[-1] - lat_edges[0]) / nlat)
 
-        fi = (new_lat - self.lat_edges[0]) / self.resolution - 0.5
+        fi = (new_lat - lat_edges[0]) / self.resolution - 0.5
         i0 = np.clip(np.floor(fi).astype(np.int64), 0, self.nlat - 1)
         i1 = np.clip(i0 + 1, 0, self.nlat - 1)
         wi = np.clip(fi - i0, 0.0, 1.0)
 
-        dlon = (self.lon_edges[-1] - self.lon_edges[0]) / self.nlon
-        fj = (new_lon - self.lon_edges[0]) / dlon - 0.5
+        dlon = (lon_edges[-1] - lon_edges[0]) / self.nlon
+        fj = (new_lon - lon_edges[0]) / dlon - 0.5
         fj_floor = np.floor(fj).astype(np.int64)
         j0 = fj_floor % self.nlon
         j1 = (j0 + 1) % self.nlon
@@ -1073,7 +1081,7 @@ class GridState:
     def validate(self, check_range: bool = True) -> list[str]:
         """校验网格元数据与全部已填充字段，返回问题列表。"""
         problems: list[str] = []
-        if self.is_global and self.grid_type == "latlon":
+        if self.is_global and self.grid_type == "latlon" and self.lat is not None:
             if abs(self.lat.min() + 90.0) > self.resolution:
                 problems.append("全球网格的纬度范围未覆盖 [-90, 90]")
         if abs(self.total_area - 4.0 * np.pi * self.geometry.radius**2) > 1e-9 * self.total_area:

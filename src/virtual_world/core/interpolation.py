@@ -74,7 +74,7 @@ def _bilinear_2d(
     wj_row = wj.reshape(*lead, -1)
     top = v00 * (1.0 - wj_row) + v01 * wj_row
     bottom = v10 * (1.0 - wj_row) + v11 * wj_row
-    return top * (1.0 - wi_col) + bottom * wi_col
+    return np.asarray(top * (1.0 - wi_col) + bottom * wi_col)
 
 
 def regrid(
@@ -149,7 +149,7 @@ def value_at_coords(
     def gather1d(index: np.ndarray, axis0_idx: np.ndarray | None = None) -> np.ndarray:
         # index: (nq,) 列索引；axis0_idx 为 (nq,) 行索引（None 表示整点收集）
         rows = values2d[..., axis0_idx, :] if axis0_idx is not None else values2d
-        out = np.empty(*lead, nq, dtype=values.dtype)
+        out = np.empty(lead + (nq,), dtype=values.dtype)
         for k in range(nq):
             out[..., k] = rows[..., :, index[k]]
         return out
@@ -167,7 +167,7 @@ def value_at_coords(
     v11 = gather1d(j_hi, i_hi)
     top = v00 * (1.0 - wj) + v01 * wj
     bottom = v10 * (1.0 - wj) + v11 * wj
-    return top * (1.0 - wi) + bottom * wi
+    return np.asarray(top * (1.0 - wi) + bottom * wi)
 
 
 __all__ = ["Order", "regrid", "value_at_coords"]
