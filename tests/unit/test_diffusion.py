@@ -299,6 +299,29 @@ def test_model_refiner_reports_missing_dependency() -> None:
         refiner.refine_tile(tcond, seed=0)
 
 
+def test_model_refiner_dependency_guard_is_not_the_active_path() -> None:
+    """diffusers 已安装时，报错必须来自"权重未缓存"而非"缺依赖"（P1-5）。
+
+    安装 diffusers 之前 ``_load`` 必定停在 ImportError 分支；安装之后该分支不应再
+    触发，模型加载只因权重未缓存/未下载而失败。两条路径的报错文案必须可区分。
+    """
+    pytest.importorskip("diffusers")
+    refiner = df.TerrainDiffusionRefiner(
+        model_id="xandergos/terrain-diffusion-90m", allow_download=False
+    )
+    nlat, nlon = 8, 16
+    tec = _tectonic(nlat, nlon, seed=1)
+    cond = df.build_condition_channels(tec, _boundary_types(nlat, nlon), block=4)
+    tcond = df.TileConditions.from_global(
+        df.Tile(0, nlat, 0, nlon), tec, cond, _sphere_coords(nlat, nlon, scale=4.0)
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        refiner.refine_tile(tcond, seed=0)
+    message = str(excinfo.value)
+    assert "未在本地缓存" in message, f"应命中缓存分支，实际: {message}"
+    assert "请先安装" not in message, f"依赖已安装，不应再报缺依赖: {message}"
+
+
 # ===== 行为 7：三频带融合（§5.1） =====
 
 
@@ -613,3 +636,139 @@ def test_condition_cache_preserves_kernel_map(tmp_path) -> None:
     second = df.ConditionsCache(tmp_path).get_or_build(key, lambda: df.build_condition_channels(tec, bt, block=4))
     assert np.array_equal(first.kernel_map, second.kernel_map)
     assert np.array_equal(second.kernel_map, nr.select_noise_kernel(bt, tec))
+
+
+# ===== 行为 11：分层扩散堆叠（§3.4） =====
+
+
+class _RecordingRefiner:
+    """记录每层收到的条件地形，用于验证 §3.4 "以上一层输出作为条件"。"""
+
+    def __init__(self, wave: float = 1.0) -> None:
+        self.wave = wave
+        self.seen: list[np.ndarray] = []
+
+    def refine_tile(self, conditions: df.TileConditions, seed: int) -> np.ndarray:
+        self.seen.append(np.array(conditions.tectonic, copy=True))
+        i = np.arange(conditions.tectonic.shape[0])[:, None]
+        j = np.arange(conditions.tectonic.shape[1])[None, :]
+        return self.wave * np.cos(2.0 * np.pi * i / 6.0) * np.sin(2.0 * np.pi * j / 6.0)
+
+
+def _levels(tile_size: int = 32, overlap: int = 0) -> list[df.DiffusionLevel]:
+    return [
+        df.DiffusionLevel(freq_scale=8.0, residual_fraction=0.06, tile_size=tile_size, overlap=overlap),
+        df.DiffusionLevel(freq_scale=18.0, residual_fraction=0.03, tile_size=tile_size, overlap=overlap),
+    ]
+
+
+def test_hierarchical_conditions_on_previous_level_output() -> None:
+    """§3.4 核心机制：第 k 层条件必须由第 k−1 层输出重建，而非原始构造场。"""
+    nlat, nlon = 24, 48
+    tec = _tectonic(nlat, nlon)
+    bt = _boundary_types(nlat, nlon)
+    spy = _RecordingRefiner()
+    levels = _levels(tile_size=48)
+    result = df.refine_diffusion_hierarchical(
+        tec, bt, seed=5, block=4, levels=levels, refiners=[spy, spy]
+    )
+
+    assert len(spy.seen) == 2, "每层应各调用一次（单 tile 覆盖全网格）"
+    # 最粗层：条件即构造场本身（第一层已给出宏观结构，跳过最粗模型）
+    np.testing.assert_allclose(spy.seen[0], tec)
+    # 细层：条件 = 构造场 + 粗层残差
+    np.testing.assert_allclose(spy.seen[1], tec + result.level_residuals[0])
+    assert not np.allclose(spy.seen[1], tec), "细层条件不应仍等于原始构造场"
+
+
+def test_hierarchical_identity_and_determinism() -> None:
+    """恒等式 H_final = H_tectonic + Σ 各层残差；且同种子逐位可复现。"""
+    nlat, nlon = 24, 48
+    tec = _tectonic(nlat, nlon)
+    bt = _boundary_types(nlat, nlon)
+    kwargs = {"seed": 11, "block": 4, "levels": _levels()}
+    first = df.refine_diffusion_hierarchical(tec, bt, **kwargs)
+    second = df.refine_diffusion_hierarchical(tec, bt, **kwargs)
+
+    np.testing.assert_allclose(
+        tec + sum(first.level_residuals), first.elevation, atol=1e-9
+    )
+    np.testing.assert_array_equal(first.elevation, second.elevation)
+    assert first.report["n_levels"] == len(first.level_residuals)
+
+
+def test_hierarchical_levels_are_progressively_finer() -> None:
+    """自粗到细：细层残差的相对梯度必须大于粗层（方案 §3.4 的尺度分工）。"""
+    nlat, nlon = 24, 48
+    tec = _tectonic(nlat, nlon)
+    bt = _boundary_types(nlat, nlon)
+    noise = nr.refine_noise(tec, bt, seed=3, freq_scale=4.0)
+    result = df.refine_diffusion_hierarchical(
+        tec, bt, seed=5, noise=noise.residual, block=4, levels=_levels()
+    )
+
+    def relative_gradient(field: np.ndarray) -> float:
+        std = float(np.std(field))
+        return float(np.mean(np.abs(np.diff(field, axis=1)))) / max(std, 1e-12)
+
+    coarse, fine = result.level_residuals
+    assert relative_gradient(fine) > relative_gradient(coarse)
+
+
+def test_hierarchical_macro_layout_untouched() -> None:
+    """跨层约束（方案 §1.1）：堆叠后海岸线被钉住，且低频格局不被移动。
+
+    低频不变的精确含义：每层残差都被约束强制为**块内零均值**，因此逐块均值
+    ``mean(H_final) == mean(H_tectonic)``——即第一层建立的大尺度格局完整保留，
+    堆叠只在块尺度以下注入细节。
+    """
+    nlat, nlon = 24, 48
+    tec = _tectonic(nlat, nlon)
+    tec[nlat // 2, :] = 0.0  # 显式构造一条岸线（同 test_refine_diffusion_coastline_pinned_to_sea_level）
+    bt = _boundary_types(nlat, nlon)
+    block = 4
+    result = df.refine_diffusion_hierarchical(tec, bt, seed=7, block=block, levels=_levels())
+
+    # 海岸线钉回 0
+    coast = np.abs(result.tectonic) < df.COASTLINE_EPS
+    assert coast.any()
+    assert np.all(result.elevation[coast] == 0.0)
+
+    # 逐块均值（低频分量）与构造层一致
+    tec_block = nr.block_mean(tec, block)
+    out_block = nr.block_mean(result.elevation, block)
+    np.testing.assert_allclose(out_block, tec_block, atol=1e-6)
+
+    # 每层残差各自块内零均值
+    for residual in result.level_residuals:
+        assert abs(float(residual.mean())) < 1e-6
+
+
+def test_hierarchical_rejects_bad_inputs() -> None:
+    nlat, nlon = 8, 16
+    tec = _tectonic(nlat, nlon)
+    bt = _boundary_types(nlat, nlon)
+    with pytest.raises(ValueError, match="经纬网格"):
+        df.refine_diffusion_hierarchical(np.zeros((6, 8, 8)), np.zeros((6, 8, 8), dtype=np.int32))
+    with pytest.raises(ValueError, match="不能为空"):
+        df.refine_diffusion_hierarchical(tec, bt, levels=[])
+    with pytest.raises(ValueError, match="不一致"):
+        df.refine_diffusion_hierarchical(tec, bt, levels=_levels(), refiners=[_RecordingRefiner()])
+    with pytest.raises(ValueError, match="freq_scale"):
+        df.refine_diffusion_hierarchical(tec, bt, levels=[df.DiffusionLevel(freq_scale=0.0)])
+    with pytest.raises(ValueError, match="seed"):
+        df.refine_diffusion_hierarchical(tec, bt, seed=-1)
+
+
+def test_hierarchical_conditions_cache_reuse(tmp_path) -> None:
+    """每层条件通道可缓存（§4.3）：跨进程复用同一 key 时结果一致。"""
+    nlat, nlon = 16, 32
+    tec = _tectonic(nlat, nlon)
+    bt = _boundary_types(nlat, nlon)
+    levels = _levels(tile_size=32)
+    caches = [df.ConditionsCache(tmp_path / f"L{i}") for i in range(len(levels))]
+    cached = df.refine_diffusion_hierarchical(
+        tec, bt, seed=9, block=4, levels=levels, caches=caches
+    )
+    plain = df.refine_diffusion_hierarchical(tec, bt, seed=9, block=4, levels=levels)
+    np.testing.assert_allclose(cached.elevation, plain.elevation, atol=1e-12)

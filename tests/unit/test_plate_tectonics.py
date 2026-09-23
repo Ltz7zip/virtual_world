@@ -591,3 +591,39 @@ def test_regrid_rejects_latlon_result() -> None:
     with pytest.raises(ValueError):
         pt.regrid_tectonic_result(latlon, sphere, 16, 32)
 
+
+
+# ===== §6.4 JAX 长时间积分后端（可选依赖） =====
+
+
+def test_crust_integration_jax_matches_numba() -> None:
+    """``use_jax=True`` 走 lax.scan 内核，结果须与 Numba 内核逐位一致。
+
+    两个内核共用同一分裂格式（先增厚/减薄、再用更新后的厚度做重力松弛），
+    因此这里要求**逐位相同**而不只是接近。
+    """
+    pytest.importorskip("jax")
+    kwargs = {"nlat": 24, "nlon": 48, "n_major": 6, "seed": 3, "time_ma": 100.0}
+    numba = pt.generate_tectonic_field(**kwargs)
+    jax_result = pt.generate_tectonic_field(**kwargs, use_jax=True)
+
+    np.testing.assert_array_equal(
+        np.asarray(numba.crust_thickness), np.asarray(jax_result.crust_thickness)
+    )
+    np.testing.assert_array_equal(np.asarray(numba.elevation), np.asarray(jax_result.elevation))
+
+
+def test_crust_integrator_resolver_defaults_to_numba() -> None:
+    """缺省（use_jax=False）必须用 Numba 内核，避免可选依赖变成硬依赖。"""
+    from virtual_world.terrain.isostasy import integrate_crust_thickness
+
+    assert pt._resolve_crust_integrator(False) is integrate_crust_thickness
+
+
+def test_crust_integrator_resolver_selects_jax() -> None:
+    """use_jax=True 时必须返回 JAX 内核（而非静默退回 Numba）。"""
+    pytest.importorskip("jax")
+    from virtual_world.terrain.jax_kernels import integrate_crust_thickness_jax
+
+    assert pt._resolve_crust_integrator(True) is integrate_crust_thickness_jax
+    assert pt._resolve_crust_integrator(True) is not pt._resolve_crust_integrator(False)

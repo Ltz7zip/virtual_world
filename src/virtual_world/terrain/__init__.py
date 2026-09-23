@@ -10,14 +10,19 @@
 - :mod:`virtual_world.terrain.isostasy`         Airy 均衡、地壳厚度演化、质量守恒与造山带高宽比（Numba）
 - :mod:`virtual_world.terrain.plate_tectonics`  板块构造完整管线编排
 - :mod:`virtual_world.terrain.noise_refine`     噪声精修（fBm 八度去相关/域扭曲+边界引导/残差融合）
-- :mod:`virtual_world.terrain.diffusion`        扩散精修（条件通道/选核图/初始噪声/tile/约束/三频带融合）
+- :mod:`virtual_world.terrain.diffusion`        扩散精修（条件通道/选核图/初始噪声/tile/约束/三频带
+  融合 + §3.4 分层堆叠 :func:`refine_diffusion_hierarchical`）
 - :mod:`virtual_world.terrain.hydraulic_erosion` 虚拟管道水力侵蚀（Numba，Shields 阈值）
 - :mod:`virtual_world.terrain.thermal_erosion`  休止角热力侵蚀与坡面扩散（线性/非线性，Numba）
 - :mod:`virtual_world.terrain.hydrology`        洼地填充 / D8 流向 / 汇流累积 / 河网
 - :mod:`virtual_world.terrain.erosion`          第三层侵蚀完整管线编排与校验
+  （``hydraulic_backend`` 可选 Numba / JAX 内核）
 - :mod:`virtual_world.terrain.landscape_evolution` §2.1 河流功率定律 + §2.2 景观演化方程（Ma 尺度）
-- :mod:`virtual_world.terrain.jax_kernels`      §6.4 JAX 长时积分内核（可选依赖）
+- :mod:`virtual_world.terrain.jax_kernels`      JAX 内核（可选依赖）：§6.4 地壳厚度长时积分
+  :func:`integrate_crust_thickness_jax` + §6.3 水力侵蚀 :func:`hydraulic_erode_jax`
+  （``jnp.roll`` 邻居访问 + ``lax.scan`` 时间积分，与 Numba 内核数值等价）
 - :mod:`virtual_world.terrain.stage`            :class:`TerrainStage`：三层接入生产管线
+  （``jax_crust`` / ``hydraulic_backend`` / ``use_diffusion`` / ``diffusion_levels`` 等开关）
 
 网格：第 1 层（板块构造）同时支持**经纬网格**与**立方球网格**（方案 §1.5）——
 ``generate_tectonic_field(grid="cubed_sphere", n_side=...)`` 在立方球上生成，
@@ -44,17 +49,21 @@ from . import (
 from .diffusion import (
     ConditionChannels,
     ConditionsCache,
+    DiffusionLevel,
     DiffusionRefiner,
     DiffusionRefineResult,
+    HierarchicalRefineResult,
     StructuredDiffusionRefiner,
     TerrainDiffusionRefiner,
     TileConditions,
     build_condition_channels,
     d8_flow_accumulation,
+    default_levels,
     enforce_residual_constraints,
     frequency_merge,
     frequency_windows,
     refine_diffusion,
+    refine_diffusion_hierarchical,
     validate_constraints,
 )
 from .erosion import (
@@ -62,6 +71,7 @@ from .erosion import (
     DEFAULT_HILLSLOPE_KAPPA,
     DEFAULT_HYDRAULIC_STEPS,
     DEFAULT_PRECIPITATION_M_PER_S,
+    HYDRAULIC_BACKENDS,
     ErosionResult,
     simulate_erosion,
     validate_erosion,
@@ -110,7 +120,7 @@ from .isostasy import (
     shortening_distance_km,
     shortening_factor,
 )
-from .jax_kernels import integrate_crust_thickness_jax, jax_available
+from .jax_kernels import hydraulic_erode_jax, integrate_crust_thickness_jax, jax_available
 from .landscape_evolution import (
     DEFAULT_K,
     DEFAULT_KAPPA_M2_PER_MA,
@@ -207,11 +217,14 @@ __all__ = [
     "DEFAULT_PRECIPITATION_M_PER_S",
     "DEFAULT_RIVER_CELLS",
     "DISCRETE_TECTONIC_FIELDS",
+    "DiffusionLevel",
     "DiffusionRefineResult",
     "DiffusionRefiner",
     "ErosionResult",
+    "HierarchicalRefineResult",
     "HydraulicErosionResult",
     "HydrologyResult",
+    "HYDRAULIC_BACKENDS",
     "Kernel",
     "LandscapeEvolutionResult",
     "MAX_DIFFUSION_AMPLIFICATION",
@@ -248,6 +261,7 @@ __all__ = [
     "critical_velocity_from_shields",
     "crust_from_shortening",
     "d8_flow_accumulation",
+    "default_levels",
     "diffusion",
     "drainage_area",
     "enforce_residual_constraints",
@@ -265,6 +279,7 @@ __all__ = [
     "generate_tectonic_field",
     "hillslope_diffusion",
     "hydraulic_erode",
+    "hydraulic_erode_jax",
     "hydraulic_erosion",
     "hydrology",
     "integrate_crust_thickness",
@@ -294,6 +309,7 @@ __all__ = [
     "quat_omega",
     "quat_rotate",
     "refine_diffusion",
+    "refine_diffusion_hierarchical",
     "refine_noise",
     "regrid_tectonic_result",
     "ridge_half_width_km",

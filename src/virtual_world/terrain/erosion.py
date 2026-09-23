@@ -37,7 +37,11 @@ from ..core.constants import DAYS_PER_YEAR, EARTH_RADIUS, SECONDS_PER_DAY
 from ..core.grid import FIELDS
 from . import hydraulic_erosion as he
 from . import hydrology as hd
+from . import jax_kernels as jk
 from . import thermal_erosion as te
+
+#: 水力侵蚀内核实现（方案 §2.3 Numba / §6.3 JAX）
+HYDRAULIC_BACKENDS: tuple[str, ...] = ("numba", "jax")
 
 #: 默认降水速率 (m/s)：地球年降水 1 m（后续由水循环模块的降水场替代）
 DEFAULT_PRECIPITATION_M_PER_S = 1.0 / (DAYS_PER_YEAR * SECONDS_PER_DAY)
@@ -91,6 +95,7 @@ def simulate_erosion(
     hydraulic_dt: float | None = None,
     hydraulic_macormack: bool = True,
     critical_velocity: float = he.CRITICAL_VELOCITY,
+    hydraulic_backend: str = "numba",
     talus_angle_deg: float = te.DEFAULT_TALUS_ANGLE_DEG,
     thermal_iterations: int = DEFAULT_THERMAL_ITERATIONS,
     hillslope_kappa: float = DEFAULT_HILLSLOPE_KAPPA,
@@ -116,6 +121,10 @@ def simulate_erosion(
         hydraulic_macormack: 沉积物输运用 MacCormack 反扩散
         critical_velocity: Shields 临界流速 u_c (m/s)（§1.4），缺省由 Shields 准则
             按 1 mm 中砂床反解；传 0 可关闭阈值
+        hydraulic_backend: 水力侵蚀内核：``"numba"``（缺省，方案 §2.3）或 ``"jax"``
+            （方案 §6.3，``jnp.roll`` + ``lax.scan``；高分辨率网格上可编译为 XLA）。
+            两者数值等价（见 :func:`jax_kernels.hydraulic_erode_jax`）；JAX 为可选
+            依赖，未安装时抛含安装指引的错误，不静默退回 Numba
         talus_angle_deg / thermal_iterations: 热力侵蚀休止角与迭代次数
         hillslope_kappa: 坡面扩散系数 κ (m²/s)（§3.2），缺省启用（方案 §2.2 要求）；
             传 0 关闭。粗网格上量级极小，细网格或长时积分才显著
@@ -144,6 +153,10 @@ def simulate_erosion(
         raise ValueError(f"启用坡面扩散时 hillslope_dt 必须为正，实际为 {hillslope_dt}")
     if radius <= 0.0:
         raise ValueError(f"radius 必须为正，实际为 {radius}")
+    if hydraulic_backend not in HYDRAULIC_BACKENDS:
+        raise ValueError(
+            f"hydraulic_backend 必须为 {' 或 '.join(HYDRAULIC_BACKENDS)}，实际为 {hydraulic_backend!r}"
+        )
     rain = DEFAULT_PRECIPITATION_M_PER_S if precipitation is None else precipitation
     uplift_field = np.broadcast_to(np.asarray(uplift, dtype=np.float64), elev.shape)
     if np.any(uplift_field < 0.0):
@@ -162,8 +175,9 @@ def simulate_erosion(
     uplift_applied = np.where(ocean, 0.0, uplift_field)
     bed = erosion_bed + uplift_applied
 
-    # ③ 水力侵蚀（§七 第 3 步）
-    hydraulic = he.hydraulic_erode(
+    # ③ 水力侵蚀（§七 第 3 步）：内核按 hydraulic_backend 选择（§2.3 Numba / §6.3 JAX）
+    hydraulic_erode = he.hydraulic_erode if hydraulic_backend == "numba" else jk.hydraulic_erode_jax
+    hydraulic = hydraulic_erode(
         bed,
         ocean,
         precipitation=rain,
@@ -203,6 +217,7 @@ def simulate_erosion(
     thermal_drop = hydraulic.elevation - final
     land = ~ocean
     report: dict[str, float | int | str] = {
+        "hydraulic_backend": hydraulic_backend,
         "hydraulic_steps": int(hydraulic_steps),
         "hydraulic_dt_s": float(hydraulic.report["dt_s"]),
         "critical_velocity_m_per_s": float(critical_velocity),
@@ -283,12 +298,14 @@ def validate_erosion(
     land = ~ocean
     nlat = elevation.shape[0]
 
-    lo, hi = FIELDS["elevation"].valid_range
-    if float(elevation.min()) < lo or float(elevation.max()) > hi:
-        problems.append(
-            f"H_final 超出 elevation 有效范围 [{lo}, {hi}]: "
-            f"[{float(elevation.min()):.1f}, {float(elevation.max()):.1f}]"
-        )
+    valid_range = FIELDS["elevation"].valid_range
+    if valid_range is not None:
+        lo, hi = valid_range
+        if float(elevation.min()) < lo or float(elevation.max()) > hi:
+            problems.append(
+                f"H_final 超出 elevation 有效范围 [{lo}, {hi}]: "
+                f"[{float(elevation.min()):.1f}, {float(elevation.max()):.1f}]"
+            )
 
     if check_identity:
         bed = np.asarray(result.erosion_bed, dtype=np.float64)

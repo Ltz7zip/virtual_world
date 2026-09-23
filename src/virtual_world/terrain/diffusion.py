@@ -55,6 +55,8 @@ COASTLINE_EPS = 1.0
 COORDS_SCALE = 6.0
 #: 河流阈值占网格单元的比例（未显式指定时的默认值）
 RIVER_FRACTION = 0.02
+#: 分层堆叠中单层残差的默认幅度 = fraction × std(上一层地形)（§3.4）
+LEVEL_RESIDUAL_FRACTION = 0.06
 
 
 # ===== 精修器协议 =====
@@ -704,7 +706,7 @@ class TerrainDiffusionRefiner:
             return self._pipeline
         try:
             import torch
-            from diffusers import DiffusionPipeline  # type: ignore[import-not-found]
+            from diffusers import DiffusionPipeline
         except ImportError as exc:  # pragma: no cover - 取决于可选依赖
             raise RuntimeError(
                 f"扩散模型 {self.model_id} 需要 diffusers 与 torch；"
@@ -716,7 +718,7 @@ class TerrainDiffusionRefiner:
                 f"请先在线下载权重，或改用 StructuredDiffusionRefiner"
             )
         device = self.device or ("mps" if torch.backends.mps.is_available() else "cpu")
-        pipe = DiffusionPipeline.from_pretrained(
+        pipe = DiffusionPipeline.from_pretrained(  # type: ignore[no-untyped-call]
             self.model_id, torch_dtype=getattr(torch, self.dtype)
         )
         self._pipeline = pipe.to(device)
@@ -903,17 +905,223 @@ def refine_diffusion(
     )
 
 
+# ===== 分层扩散堆叠（§3.4）=====
+
+
+@dataclasses.dataclass(frozen=True)
+class DiffusionLevel:
+    """分层扩散堆叠中的一层（§3.4）。
+
+    方案 §3.4 要求"每一层以上一层的输出作为条件"：粗层建立大尺度结构，细层在被
+    粗层更新后的地形上继续注入更细尺度的细节。本项目的网格分辨率固定，因此用
+    ``freq_scale``（噪声特征频率）区分层级的**尺度**，而不是真的换网格——
+    这与 §3.4 "全局结构由最粗层决定，细节由最细层补充"的作用等价。
+
+    方案 §3.4 还指出本项目"可以跳过最粗层，直接从 1 km 分辨率的中层扩散模型开始"，
+    因此 :func:`default_levels` 返回的中层起步序列即为方案默认。
+    """
+
+    #: 本层的球面坐标频率缩放（越大特征尺度越细）
+    freq_scale: float
+    #: 本层残差幅度 = ``residual_fraction × std(上一层地形)``
+    residual_fraction: float = LEVEL_RESIDUAL_FRACTION
+    #: 本层 tile 边长与重叠（§4.2 批量推理）
+    tile_size: int = 32
+    overlap: int = 4
+
+
+def default_levels() -> list[DiffusionLevel]:
+    """方案 §3.4 的默认分层序列：跳过最粗层，自中层起步精修到细层。"""
+    return [
+        DiffusionLevel(freq_scale=8.0, residual_fraction=0.06),
+        DiffusionLevel(freq_scale=18.0, residual_fraction=0.03),
+    ]
+
+
+@dataclasses.dataclass(frozen=True)
+class HierarchicalRefineResult:
+    """分层扩散堆叠输出（§3.4）。"""
+
+    elevation: np.ndarray  # H_final：逐层累加后的高程
+    residual: np.ndarray  # 累计残差 = elevation − tectonic（低频受约束）
+    tectonic: np.ndarray  # 输入构造高程
+    level_residuals: list[np.ndarray]  # 各层各自的残差（自粗到细）
+    conditions: list[ConditionChannels]  # 各层的条件通道（逐层以上一层输出重建）
+    report: dict[str, float | int | str]
+    seed: int
+
+
+def refine_diffusion_hierarchical(
+    tectonic: np.ndarray,
+    boundary_type: np.ndarray,
+    *,
+    seed: int = 0,
+    noise: np.ndarray | None = None,
+    levels: list[DiffusionLevel] | None = None,
+    refiners: list[DiffusionRefiner] | None = None,
+    block: int = BLOCK,
+    river_threshold: float | None = None,
+    river_network: np.ndarray | None = None,
+    coastline_eps: float = COASTLINE_EPS,
+    coords_scale: float = COORDS_SCALE,
+    caches: list[ConditionsCache] | None = None,
+) -> HierarchicalRefineResult:
+    """分层扩散堆叠精修（§3.4），逐层累加残差。
+
+    与单级 :func:`refine_diffusion` 的关系：单级只做一层条件去噪；本函数把该过程
+    串成自粗到细的级联，**每一层都用上一层的输出重建条件通道**（§3.4 的核心机制），
+    从而让细层在被粗层更新过的地形上继续加细节。
+
+    层内不做三频带融合（§5.1）——堆叠本身就是频率域上的逐层累加；每层残差仍由
+    :func:`enforce_residual_constraints` 强制约束，因此**任何单层都无法移动海陆
+    边界与主要山脉位置**，宏观格局始终由第一层决定。
+
+    参数：
+        tectonic: 构造层高程 H_tectonic（m），形状 ``(nlat, nlon)``
+        boundary_type: 板块边界类型场（:class:`euler_poles.BoundaryType` 像素值）
+        seed: 确定性种子；第 k 层用 ``seed + k``，保证层间去相关
+        noise: 中频噪声基底（§5.1 中频带）；按 §5.2 第 2 步充当**最粗层**扩散采样的
+            初始噪声（更细的层不再重复注入同一频带）
+        levels: 分层序列；None 时取 :func:`default_levels`（自中层起步）
+        refiners: 每层的精修器；None 时按层构造
+            :class:`StructuredDiffusionRefiner`（用该层 ``freq_scale``）
+        block / river_threshold / river_network / coastline_eps / coords_scale:
+            同 :func:`refine_diffusion`
+        caches: 每层的条件通道缓存；None 时不缓存
+
+    返回 :class:`HierarchicalRefineResult`。
+    """
+    if seed < 0:
+        raise ValueError(f"seed 不能为负，实际为 {seed}")
+    tec = np.asarray(tectonic, dtype=np.float64)
+    bt = np.asarray(boundary_type, dtype=np.int32)
+    if tec.shape != bt.shape:
+        raise ValueError(f"tectonic 与 boundary_type 形状不一致: {tec.shape} vs {bt.shape}")
+    if tec.ndim != 2:
+        raise ValueError(
+            f"分层扩散精修仅支持 (nlat, nlon) 经纬网格，实际 {tec.shape}；"
+            "立方球网格请用 noise_refine.refine_noise，或先 regrid_tectonic_result 转回经纬网格"
+        )
+    if block < 2:
+        raise ValueError(f"block 必须 >= 2，实际为 {block}")
+
+    level_list = list(default_levels() if levels is None else levels)
+    if not level_list:
+        raise ValueError("levels 不能为空")
+    for level in level_list:
+        if level.freq_scale <= 0.0:
+            raise ValueError(f"freq_scale 必须为正，实际为 {level.freq_scale}")
+        if level.residual_fraction < 0.0:
+            raise ValueError(f"residual_fraction 不能为负，实际为 {level.residual_fraction}")
+    if refiners is not None and len(refiners) != len(level_list):
+        raise ValueError(f"refiners 长度 {len(refiners)} 与层数 {len(level_list)} 不一致")
+    if caches is not None and len(caches) != len(level_list):
+        raise ValueError(f"caches 长度 {len(caches)} 与层数 {len(level_list)} 不一致")
+
+    nlat, nlon = tec.shape
+    coords = sphere_coords(nlat, nlon, scale=coords_scale)
+    noise_field = np.zeros_like(tec) if noise is None else np.asarray(noise, dtype=np.float64)
+    if noise_field.shape != tec.shape:
+        raise ValueError(f"noise 形状 {noise_field.shape} 与构造场 {tec.shape} 不一致")
+
+    base = tec  # 当前层级的"上一层输出"，逐层被更新
+    level_residuals: list[np.ndarray] = []
+    level_conditions: list[ConditionChannels] = []
+    level_stds: list[float] = []
+
+    for index, level in enumerate(level_list):
+        level_seed = seed + index
+
+        # §3.4：本层的条件通道由**上一层的输出**重建（最粗层即构造场本身）
+        def _build(source: np.ndarray = base) -> ConditionChannels:
+            return build_condition_channels(
+                source,
+                bt,
+                block=block,
+                river_threshold=river_threshold,
+                river_network=river_network,
+            )
+
+        if caches is None:
+            channels = _build()
+        else:
+            key = condition_cache_key(base, bt, block=block, river_threshold=river_threshold)
+            channels = caches[index].get_or_build(key, _build)
+        level_conditions.append(channels)
+
+        refiner: DiffusionRefiner = (
+            refiners[index]
+            if refiners is not None
+            else StructuredDiffusionRefiner(freq_scale=level.freq_scale)
+        )
+        # §5.2 第 2 步：最粗层用中频噪声作初始噪声；细层不再重复注入同一频带
+        init_noise = noise_field if index == 0 else None
+
+        tiles = iter_tiles(nlat, nlon, level.tile_size, level.overlap)
+        pieces = [
+            refiner.refine_tile(
+                TileConditions.from_global(t, base, channels, coords, init_noise),
+                seed=level_seed,
+            )
+            for t in tiles
+        ]
+        stitched = stitch_tiles(tiles, pieces, (nlat, nlon))
+
+        # 本层残差强制约束后，再按 residual_fraction 标定到相对上一层地形的幅度
+        residual = enforce_residual_constraints(
+            stitched, base, block=block, coastline_eps=coastline_eps
+        )
+        std = float(np.std(residual))
+        if std > 1e-12 and level.residual_fraction > 0.0:
+            residual = residual / std * (level.residual_fraction * float(np.std(base)))
+        elif level.residual_fraction == 0.0:
+            residual = np.zeros_like(residual)
+
+        base = base + residual
+        level_residuals.append(residual)
+        level_stds.append(float(np.std(residual)))
+
+    # 累计残差与累计低频都受各层约束约束，因此宏观格局仍由构造层决定
+    residual_total = np.asarray(base - tec, dtype=np.float64)
+    elevation = np.asarray(base, dtype=np.float64)
+    # 海岸线钳制（§3.3）：把岸线钉回构造层设定的位置
+    coast = np.abs(tec) < coastline_eps
+    if coast.any():
+        elevation = elevation.copy()
+        elevation[coast] = 0.0
+
+    report: dict[str, float | int | str] = {
+        "n_levels": len(level_list),
+        "freq_scales": ",".join(f"{level.freq_scale:g}" for level in level_list),
+        "level_residual_std_m": ",".join(f"{value:.1f}" for value in level_stds),
+        "residual_std_m": float(np.std(residual_total)),
+        "residual_max_abs_m": float(np.abs(residual_total).max()),
+    }
+    return HierarchicalRefineResult(
+        elevation=elevation,
+        residual=residual_total,
+        tectonic=tec,
+        level_residuals=level_residuals,
+        conditions=level_conditions,
+        report=report,
+        seed=seed,
+    )
+
+
 __all__ = [
     "BLOCK",
     "COASTLINE_EPS",
     "COORDS_SCALE",
     "ConditionChannels",
     "ConditionsCache",
+    "DiffusionLevel",
     "DiffusionRefineResult",
     "DiffusionRefiner",
+    "HierarchicalRefineResult",
     "K_HIGH",
     "K_LOW",
     "K_MID",
+    "LEVEL_RESIDUAL_FRACTION",
     "RIVER_FRACTION",
     "StructuredDiffusionRefiner",
     "TerrainDiffusionRefiner",
@@ -922,11 +1130,13 @@ __all__ = [
     "build_condition_channels",
     "condition_cache_key",
     "d8_flow_accumulation",
+    "default_levels",
     "enforce_residual_constraints",
     "frequency_merge",
     "frequency_windows",
     "iter_tiles",
     "refine_diffusion",
+    "refine_diffusion_hierarchical",
     "sphere_coords",
     "stitch_tiles",
     "tile_weight_map",

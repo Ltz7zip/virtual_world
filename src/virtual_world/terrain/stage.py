@@ -35,10 +35,14 @@ from . import erosion as ero
 from . import noise_refine as nr
 from . import plate_tectonics as pt
 
-#: 本阶段覆盖的规划阶段键（:data:`virtual_world.pipeline.PLANNED_STAGES` 中的条目）
+#: 本阶段覆盖的规划阶段键（:data:`virtual_world.pipeline.PLANNED_STAGES` 中的条目）。
+#: ``diffusion`` 指第二层的扩散精修路径（:meth:`TerrainStage._layer2` 的
+#: ``use_diffusion`` / ``diffusion_levels`` 两条分支）；``landscape_evolution``
+#: （Ma 尺度长期演化）**不在**此列——它未接入本阶段，仍应报告为待实现。
 COVERS: tuple[tuple[str, str], ...] = (
     ("terrain", "plate_tectonics"),
     ("terrain", "noise_refine"),
+    ("terrain", "diffusion"),
     ("terrain", "erosion"),
     ("terrain", "hydrology"),
 )
@@ -82,6 +86,9 @@ class TerrainStage:
     dt_ma: float = 1.0
     ocean_fraction: float = pt.DEFAULT_OCEAN_FRACTION
     subduction: bool = True
+    #: 第一层地壳厚度时间积分改用 JAX（方案 §6.4，``lax.scan``）；缺省 Numba 内核。
+    #: 两者数值一致；长时积分（数千步）在 GPU 上收益显著。JAX 为可选依赖
+    jax_crust: bool = False
 
     # ===== 第二层：噪声与扩散精修（方案第二层 §一–§七）=====
     refine: bool = True
@@ -90,10 +97,16 @@ class TerrainStage:
     residual_fraction: float = nr.RESIDUAL_FRACTION
     #: 用扩散模型精修（§三）；需可选依赖 ``diffusers`` 与模型权重，缺省走纯噪声路径
     use_diffusion: bool = False
+    #: 分层扩散堆叠的分层序列（§3.4）；None 时用单级精修（§3.2/§3.3）。
+    #: 给定多个层时改用 :func:`diffusion.refine_diffusion_hierarchical` 逐层累加
+    diffusion_levels: list[df.DiffusionLevel] | None = None
 
     # ===== 第三层：侵蚀模拟（方案第三层 §一–§七）=====
     erode: bool = True
     hydraulic_steps: int = ero.DEFAULT_HYDRAULIC_STEPS
+    #: 第三层水力侵蚀内核：``"numba"``（缺省，方案 §2.3）或 ``"jax"``
+    #: （方案 §6.3，``jnp.roll`` + ``lax.scan``，高分辨率网格上编译为 XLA）。两者数值等价
+    hydraulic_backend: str = "numba"
     #: 侵蚀演化期间持续构造抬升的时间跨度 (Ma)，用于叠加第三层方案 §2.2 的 ``U`` 项。
     #: 缺省 0：本层是 100 m–1 km 尺度的**微观刻蚀**，第一层给出的均衡高程已含造山结果，
     #: 直接再叠加会重复计入抬升。Ma 尺度的抬升-下切长期耦合请用
@@ -136,6 +149,7 @@ class TerrainStage:
             ocean_fraction=self.ocean_fraction,
             subduction=self.subduction,
             radius=radius,
+            use_jax=self.jax_crust,
         )
 
     def _layer2(
@@ -157,6 +171,19 @@ class TerrainStage:
         if not self.use_diffusion:
             return noise.elevation, info
         # §5.1/§5.2：噪声基底既是中频带，也作为扩散采样的初始噪声
+        if self.diffusion_levels is not None:
+            # §3.4 分层扩散堆叠：逐层以上一层输出为条件，自粗到细累加
+            hierarchical = df.refine_diffusion_hierarchical(
+                tectonic.elevation,
+                tectonic.boundary_type,
+                seed=seed,
+                noise=noise.residual,
+                levels=self.diffusion_levels,
+            )
+            info["layer2_path"] = "diffusion-hierarchical"
+            info["diffusion_levels"] = hierarchical.report["n_levels"]
+            info["diffusion_residual_std_m"] = float(np.std(hierarchical.residual))
+            return hierarchical.elevation, info
         diff = df.refine_diffusion(
             tectonic.elevation,
             tectonic.boundary_type,
@@ -173,7 +200,7 @@ class TerrainStage:
         uplift_rate: np.ndarray,
         seed: int,
         radius: float,
-    ) -> tuple[np.ndarray, dict[str, float | int]]:
+    ) -> tuple[np.ndarray, dict[str, float | int | str]]:
         """第三层：侵蚀雕刻（第三层方案 §七 伪代码 1–9，含 D8 河网）。"""
         erosion = ero.simulate_erosion(
             elevation,
@@ -181,6 +208,7 @@ class TerrainStage:
             uplift=np.asarray(uplift_rate, dtype=np.float64) * self.uplift_period_ma,
             seed=seed,
             hydraulic_steps=self.hydraulic_steps,
+            hydraulic_backend=self.hydraulic_backend,
             radius=radius,
         )
         report = erosion.report
@@ -189,6 +217,7 @@ class TerrainStage:
             # 本层是秒级时间步的微观刻蚀，降幅在毫米量级，用 mm 汇报才有区分度
             "mean_land_drop_mm": float(report["mean_land_drop_m"]) * 1.0e3,
             "max_total_drop_m": float(report["max_total_drop_m"]),
+            "hydraulic_backend": str(report["hydraulic_backend"]),
         }
 
     # ===== 执行 =====
@@ -217,7 +246,7 @@ class TerrainStage:
         surface = _pin_coastline(surface, is_ocean)
 
         # L3 雕刻层：河流切割、坡面冲刷（内部完成洼地填充 → D8 → 汇流 → 河网）
-        l3_info: dict[str, float | int] = {}
+        l3_info: dict[str, float | int | str] = {}
         if self.erode:
             surface, l3_info = self._layer3(
                 surface, is_ocean, tectonic.uplift_rate_m_per_ma, seed, radius
@@ -258,7 +287,7 @@ class TerrainStage:
         self,
         tectonic: pt.TectonicFieldResult,
         l2_info: dict[str, float | str],
-        l3_info: dict[str, float | int],
+        l3_info: dict[str, float | int | str],
         surface: np.ndarray,
         is_ocean: np.ndarray,
     ) -> None:
@@ -267,7 +296,12 @@ class TerrainStage:
             f"L1 {self.n_major}板块 海陆比{float(np.mean(is_ocean)):.2f} "
             f"H∈[{float(surface.min()):.0f},{float(surface.max()):.0f}]m"
         ]
-        if l2_info.get("layer2_path") == "diffusion":
+        if l2_info.get("layer2_path") == "diffusion-hierarchical":
+            parts.append(
+                f"L2 分层扩散{int(l2_info.get('diffusion_levels', 0))}层 "
+                f"残差σ={float(l2_info.get('diffusion_residual_std_m', 0.0)):.1f}m"
+            )
+        elif l2_info.get("layer2_path") == "diffusion":
             parts.append(f"L2 扩散残差σ={float(l2_info.get('diffusion_residual_std_m', 0.0)):.1f}m")
         elif l2_info.get("layer2_path") == "noise":
             parts.append(f"L2 噪声残差σ={float(l2_info.get('noise_residual_std_m', 0.0)):.1f}m")
@@ -282,6 +316,12 @@ class TerrainStage:
         else:
             parts.append("L3 关闭")
         parts.append(f"造山带高宽比{tectonic.orogen_aspect_ratio:.2f}")
+        # 内核后端可观测：明确报告哪些路径用 JAX（§6.3/§6.4），避免"以为跑了 GPU"
+        if self.jax_crust or self.hydraulic_backend == "jax":
+            parts.append(
+                f"内核[L1={'jax' if self.jax_crust else 'numba'} "
+                f"L3={self.hydraulic_backend}]"
+            )
         self.last_message = "; ".join(parts)
 
 

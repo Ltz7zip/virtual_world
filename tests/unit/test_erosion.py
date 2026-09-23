@@ -27,6 +27,7 @@ from virtual_world.core.grid import FIELDS
 from virtual_world.terrain import erosion as ero
 from virtual_world.terrain import hydraulic_erosion as he
 from virtual_world.terrain import hydrology as hd
+from virtual_world.terrain import jax_kernels
 from virtual_world.terrain import noise_refine as nr
 from virtual_world.terrain import thermal_erosion as te
 
@@ -1038,3 +1039,56 @@ def test_validate_erosion_detects_talus_violation() -> None:
         bad, radius=SMALL_RADIUS, talus_angle_deg=33.0, check_identity=False
     )
     assert any("休止角" in p for p in problems)
+
+
+# ===== §6.3 水力侵蚀的 JAX 内核后端（可选依赖） =====
+
+
+def test_simulate_erosion_rejects_unknown_hydraulic_backend() -> None:
+    """后端必须是已注册的实现之一，拼错时立即报错而不是静默换内核。"""
+    elev, ocean = _cone_island()
+    with pytest.raises(ValueError, match="hydraulic_backend"):
+        ero.simulate_erosion(elev, ocean, precipitation=P_EARTH, hydraulic_backend="cuda")
+
+
+def test_simulate_erosion_records_hydraulic_backend() -> None:
+    """report 必须记录实际使用的内核，保证"跑了哪个后端"可观测。"""
+    elev, ocean = _cone_island()
+    result = ero.simulate_erosion(elev, ocean, precipitation=P_EARTH, hydraulic_steps=20)
+    assert result.report["hydraulic_backend"] == "numba"
+    assert set(ero.HYDRAULIC_BACKENDS) == {"numba", "jax"}
+
+
+@pytest.mark.skipif(not jax_kernels.jax_available(), reason="未安装 jax（pip install jax）")
+def test_simulate_erosion_jax_backend_matches_numba() -> None:
+    """``hydraulic_backend="jax"`` 与缺省 Numba 路径在第三层管线级等价。
+
+    热力侵蚀与河网步骤是共用的，因此这里验证的是"换内核后整条第三层管线结果不变"。
+    """
+    elev, ocean = _cone_island()
+    kwargs = dict(precipitation=P_EARTH, hydraulic_steps=40, seed=3)
+    numba = ero.simulate_erosion(elev, ocean, **kwargs)
+    jax_result = ero.simulate_erosion(elev, ocean, hydraulic_backend="jax", **kwargs)
+
+    assert jax_result.report["hydraulic_backend"] == "jax"
+    assert numba.report["hydraulic_backend"] == "numba"
+    for name in ("elevation", "hydraulic_drop", "river_width"):
+        deviation = float(
+            np.abs(
+                np.asarray(getattr(numba, name), dtype=np.float64)
+                - np.asarray(getattr(jax_result, name), dtype=np.float64)
+            ).max()
+        )
+        assert deviation <= 1e-9, f"{name} 偏差 {deviation:.3e} 超限"
+    # 河网是分类结果，必须逐格一致
+    np.testing.assert_array_equal(numba.river_network, jax_result.river_network)
+
+
+@pytest.mark.skipif(not jax_kernels.jax_available(), reason="未安装 jax（pip install jax）")
+def test_simulate_erosion_jax_backend_passes_validation() -> None:
+    """JAX 后端产出的结果同样满足第三层的不变量复核。"""
+    elev, ocean = _cone_island()
+    result = ero.simulate_erosion(
+        elev, ocean, precipitation=P_EARTH, hydraulic_steps=40, hydraulic_backend="jax"
+    )
+    assert ero.validate_erosion(result) == []

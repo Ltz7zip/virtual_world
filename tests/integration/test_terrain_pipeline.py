@@ -24,6 +24,7 @@ from virtual_world.pipeline import (
     create_world,
     default_stages,
 )
+from virtual_world.terrain import jax_kernels
 from virtual_world.terrain.stage import OUTPUT_FIELDS, TerrainStage
 
 #: 粗分辨率（10° → 18x36 网格），并在每层用较小工作量
@@ -48,11 +49,27 @@ def _state(grid_type: str = "latlon") -> GridState:
 
 
 def test_default_stages_cover_the_terrain_planned_stages():
-    """默认阶段必须声明覆盖 PLANNED_STAGES 中全部 terrain 条目。"""
+    """covers 只能声明 terrain 条目，且两条第二层路径都已接入。
+
+    ``landscape_evolution``（Ma 尺度长期演化）是**故意**不在 covers 内的：模块已实现
+    但未接入本阶段，因此必须继续被报告为待实现，而不是被 covers 悄悄盖掉。
+    """
     terrain_keys = {key for key in PLANNED_STAGES if key[0] == "terrain"}
     covered = {key for stage in default_stages() for key in stage.covers}
     assert terrain_keys, "PLANNED_STAGES 应包含 terrain 条目"
-    assert terrain_keys <= covered
+    assert covered <= terrain_keys, f"covers 不应声明非 terrain 条目: {covered - terrain_keys}"
+
+    # 已接入的生产路径
+    for key in (
+        ("terrain", "plate_tectonics"),
+        ("terrain", "noise_refine"),
+        ("terrain", "diffusion"),
+        ("terrain", "erosion"),
+        ("terrain", "hydrology"),
+    ):
+        assert key in covered, f"{key} 应已被 TerrainStage 覆盖"
+    # 未接入：保持诚实报告
+    assert ("terrain", "landscape_evolution") not in covered
 
 
 def test_default_stages_satisfy_pipeline_stage_protocol():
@@ -154,6 +171,70 @@ def test_terrain_stage_preserves_layer1_macro_layout():
     assert not np.allclose(state.as_numpy("elevation"), tectonic.elevation)
 
 
+# ===== 第二层：分层扩散堆叠（§3.4）经生产阶段 =====
+
+
+def test_terrain_stage_hierarchical_diffusion_path():
+    """``use_diffusion + diffusion_levels`` 应走 §3.4 分层堆叠，且宏观格局不变。"""
+    from virtual_world.terrain import diffusion as df
+
+    stage = TerrainStage(
+        n_major=6,
+        hydraulic_steps=40,
+        use_diffusion=True,
+        diffusion_levels=df.default_levels(),
+    )
+    state = _state()
+    stage.run(state)
+
+    assert "分层扩散2层" in stage.last_message
+    elevation = state.as_numpy("elevation")
+    assert np.all(np.isfinite(elevation))
+    # 跨层约束（方案 §1.1）：海陆划分仍由第一层决定
+    assert np.all(elevation[state.as_numpy("is_ocean")] < 0.0)
+
+
+def test_terrain_stage_hierarchical_differs_from_noise_only():
+    """注入分层扩散细节后，高程必须实际不同于纯噪声路径（否则是静默跳过）。"""
+    from virtual_world.terrain import diffusion as df
+
+    noise_only = _state()
+    dataclasses.replace(_stage(), refine=True).run(noise_only)
+    layered = _state()
+    TerrainStage(
+        n_major=6,
+        hydraulic_steps=40,
+        use_diffusion=True,
+        diffusion_levels=df.default_levels(),
+    ).run(layered)
+
+    assert not np.allclose(noise_only.as_numpy("elevation"), layered.as_numpy("elevation"))
+
+
+# ===== §6.3/§6.4 JAX 内核后端（可选依赖）经生产阶段 =====
+
+
+@pytest.mark.skipif(not jax_kernels.jax_available(), reason="未安装 jax（pip install jax）")
+def test_terrain_stage_jax_backends_match_numba():
+    """整条地形链切换到 JAX 内核后，产出必须与缺省 Numba 路径逐位一致。"""
+    numba_stage = _stage()
+    jax_stage = dataclasses.replace(_stage(), jax_crust=True, hydraulic_backend="jax")
+
+    numba_state = _state()
+    jax_state = _state()
+    numba_stage.run(numba_state)
+    jax_stage.run(jax_state)
+
+    # 内核选择必须可观测，避免"以为跑了 GPU"
+    assert "内核[L1=jax L3=jax]" in jax_stage.last_message
+    assert "内核[" not in numba_stage.last_message
+
+    for name in OUTPUT_FIELDS:
+        np.testing.assert_array_equal(
+            numba_state.as_numpy(name), jax_state.as_numpy(name), err_msg=f"{name} 不一致"
+        )
+
+
 # ===== 三种网格对等（方案 §1.5）=====
 
 
@@ -205,5 +286,7 @@ def test_create_world_without_explicit_stages_uses_defaults():
     # 地形覆盖的规划条目不应再出现在未实现清单中
     for _, stage_name in TerrainStage.covers:
         assert stage_name not in not_implemented
+    # 未接入的地形条目（Ma 尺度长期演化）应仍在未实现清单中
+    assert "landscape_evolution" in not_implemented
     # 后续物理阶段仍待实现（辐射起）
     assert "insolation" in not_implemented

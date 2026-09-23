@@ -76,8 +76,10 @@ class RuntimeConfig:
 PLANNED_STAGES: list[tuple[str, str]] = [
     ("terrain", "plate_tectonics"),
     ("terrain", "noise_refine"),
+    ("terrain", "diffusion"),
     ("terrain", "erosion"),
     ("terrain", "hydrology"),
+    ("terrain", "landscape_evolution"),
     ("radiation", "insolation"),
     ("radiation", "radiative_transfer"),
     ("surface", "energy_balance"),

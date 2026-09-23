@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import numpy as np
 
@@ -105,6 +106,25 @@ MODEL_RATE_TO_RAD_PER_S = (
     / (1.0e6 * DAYS_PER_YEAR * SECONDS_PER_DAY)
     / EARTH_RADIUS
 )
+
+
+# ===== 地壳厚度时间积分的后端选择（§6.4）=====
+
+
+def _resolve_crust_integrator(use_jax: bool) -> Any:
+    """选地壳厚度时间积分的实现：``use_jax`` 时返回 JAX 版，否则返回 Numba 版。
+
+    两者签名与数值结果一致（同一分裂格式，见
+    :func:`virtual_world.terrain.jax_kernels.integrate_crust_thickness_jax`）。JAX 是
+    可选依赖，因此这里**惰性导入**：未安装 jax 时不在导入期报错，而是在调用
+    JAX 版时抛出含安装指引的 :class:`RuntimeError`（不静默退回 Numba，否则调用方
+    会以为拿到了 GPU 加速的结果）。
+    """
+    if not use_jax:
+        return integrate_crust_thickness
+    from .jax_kernels import integrate_crust_thickness_jax
+
+    return integrate_crust_thickness_jax
 
 
 @dataclasses.dataclass(frozen=True)
@@ -535,6 +555,7 @@ def generate_tectonic_field(
     grid: str = "latlon",
     n_side: int | None = None,
     radius: float = EARTH_RADIUS,
+    use_jax: bool = False,
 ) -> TectonicFieldResult:
     """运行完整板块构造管线（§7 伪代码 1–12）。
 
@@ -545,6 +566,11 @@ def generate_tectonic_field(
 
     ``warp_fraction`` 为域扭曲幅度相对板块平均角半径的比例（§1.2.1 步骤三：
     板块平均边长的 10%–20%）。``ocean_fraction`` 控制海洋面积占比（§1.6-1）。
+
+    ``use_jax=True`` 时把第 9–10 步的地壳厚度时间积分交给
+    :func:`jax_kernels.integrate_crust_thickness_jax`（方案 §6.4：``lax.scan`` 把
+    数千步的时间循环编译成 XLA 计算图，长时积分在 GPU 上收益显著）。两者数值一致
+    （同一分裂格式），缺 JAX 时会抛出含安装指引的错误，而不是静默退回 Numba。
     """
     if grid not in {"latlon", "cubed_sphere"}:
         raise ValueError(f"grid 必须为 'latlon' 或 'cubed_sphere'，实际为 {grid!r}")
@@ -570,7 +596,7 @@ def generate_tectonic_field(
         lat_1d = -90.0 + step_lat / 2 + step_lat * np.arange(nlat)
         lon_1d = -180.0 + step_lon / 2 + step_lon * np.arange(nlon)
         lat_2d, lon_2d = np.meshgrid(lat_1d, lon_1d, indexing="ij")
-        shape = (nlat, nlon)
+        shape: tuple[int, ...] = (nlat, nlon)
         xyz = _surface_xyz(lat_2d, lon_2d)
         neighbours = voronoi.latlon_neighbours(nlat, nlon)
         cell_angle_deg = step_lat
@@ -653,8 +679,9 @@ def generate_tectonic_field(
     beta_max = mass_conservation_beta(conv_rate, plate_length[plate_map], time_ma)
     continental_cap = CONTINENTAL_CRUST_KM * beta_max
 
-    # 9–10：地壳厚度时间积分（Numba 内核）
-    crust = integrate_crust_thickness(
+    # 9–10：地壳厚度时间积分（§6.4：缺省 Numba 内核；use_jax 时走 JAX lax.scan）
+    integrator = _resolve_crust_integrator(use_jax)
+    crust = integrator(
         c_eq,
         thickening=THICKENING_EFFICIENCY * conv_rate * dt_ma,
         thinning=THINNING_EFFICIENCY * div_rate * dt_ma,
@@ -806,7 +833,7 @@ def regrid_tectonic_result(
         raise ValueError(
             f"结果网格 {result.elevation.shape} 与立方球 {sphere.shape} 不一致，无需重网格"
         )
-    values: dict[str, object] = {}
+    values: dict[str, Any] = {}
     cells = None
     for name in CONTINUOUS_TECTONIC_FIELDS:
         values[name] = sphere.to_latlon(np.asarray(getattr(result, name)), nlat, nlon)
