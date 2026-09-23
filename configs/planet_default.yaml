@@ -1,0 +1,32 @@
+# 默认行星参数（类地行星，取自设计方案 §3.2 的默认值）
+name: default
+
+# 几何
+radius: 6.371e6          # 行星半径 (m)
+flattening: 0.0          # 扁率
+gravity: 9.81            # 表面重力加速度 (m/s^2)
+
+# 自转与轨道
+rotation_rate: 7.292e-5  # 自转角速度 (rad/s)
+axial_tilt: 23.44        # 轴倾角 (deg)
+orbital_period: 365.25   # 公转周期 (day)
+eccentricity: 0.0167     # 轨道偏心率
+perihelion_arg: 102.9    # 近日点幅角 (deg)
+semi_major_axis: 1.496e11  # 轨道半长轴 (m)
+
+# 恒星
+solar_constant: 1361.0   # 恒星常数 (W/m^2)
+stellar_mass: 1.989e30   # 恒星质量 (kg)
+
+# 大气
+p_surface: 101325.0      # 表面气压 (Pa)
+greenhouse_factor: 1.0   # 温室效应因子
+atm_composition:         # 体积/摩尔混合比（H2O 为可变量）
+  N2: 0.78
+  O2: 0.21
+  CO2: 0.0004
+  H2O: 0.01
+
+# 海洋
+ocean_fraction: 0.71     # 海洋面积占比
+ocean_depth_mean: 3700   # 平均海洋深度 (m)

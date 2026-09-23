@@ -1,0 +1,29 @@
+# 验证阈值配置（见《完善验证与保真度检验》§12.2）
+conservation:
+  energy_drift: 0.001            # 0.1%/天
+  mass_drift: 1.0e-6             # 10^-6/天
+  angular_momentum_drift: 0.01   # 1%/天
+
+dynamics:
+  ageostrophic_deviation: 0.20   # 20%
+  thermal_wind_consistency: 0.15 # 15%
+
+radiation:
+  planetary_energy_balance: 0.01 # 1%
+  olr_bias: 5.0                  # W/m^2
+
+hydrology:
+  global_water_balance: 0.01     # 1%
+  runoff_consistency: 0.05       # 5%
+
+ocean:
+  sverdrup_agreement: 0.70       # 70%
+
+ecology:
+  koppen_accuracy: 0.70          # 70%
+  multi_scale_violation_rate: 0.05  # 5%
+
+earth_comparison:
+  global_temp_bias: 2.0          # degC
+  global_precip_bias: 0.15       # 15%
+  itcz_lat_bias: 5.0             # deg

@@ -1,0 +1,33 @@
+# 地球参数（用于与真实观测数据对比验证，见《完善验证与保真度检验》第八层）
+name: earth
+
+# 几何
+radius: 6.3710088e6      # 平均半径 (m)
+flattening: 0.0033528    # 1/298.257223563
+gravity: 9.80665         # 标准重力 (m/s^2)
+
+# 自转与轨道
+rotation_rate: 7.292115e-5  # 恒星日 86164.09 s
+axial_tilt: 23.4393         # 黄赤交角 (deg)
+orbital_period: 365.256363  # 恒星年 (day)
+eccentricity: 0.0167086
+perihelion_arg: 102.94719   # 近日点黄经 (deg)
+semi_major_axis: 1.495978707e11  # 天文单位 (m)
+
+# 恒星
+solar_constant: 1361.0    # 太阳常数 (W/m^2)
+stellar_mass: 1.98841e30  # 太阳质量 (kg)
+
+# 大气
+p_surface: 101325.0
+greenhouse_factor: 1.0
+atm_composition:          # 干空气成分 + 水汽
+  N2: 0.78084
+  O2: 0.20946
+  Ar: 0.00934
+  CO2: 0.00042
+  H2O: 0.01
+
+# 海洋
+ocean_fraction: 0.708     # 海面占比
+ocean_depth_mean: 3688    # 平均水深 (m)

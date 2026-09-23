@@ -1,0 +1,32 @@
+# 海洋行星：几乎全被海洋覆盖，水汽充沛、温室效应强
+name: ocean
+
+# 几何
+radius: 6.371e6
+flattening: 0.0
+gravity: 9.81
+
+# 自转与轨道
+rotation_rate: 7.292e-5
+axial_tilt: 15.0
+orbital_period: 365.25
+eccentricity: 0.0167
+perihelion_arg: 102.9
+semi_major_axis: 1.496e11
+
+# 恒星
+solar_constant: 1300.0
+stellar_mass: 1.989e30
+
+# 大气
+p_surface: 105000.0
+greenhouse_factor: 1.15  # 水汽反馈增强温室效应
+atm_composition:
+  N2: 0.76
+  O2: 0.22
+  CO2: 0.0004
+  H2O: 0.019   # 大气含水量约为地球的两倍
+
+# 海洋
+ocean_fraction: 0.98
+ocean_depth_mean: 4000

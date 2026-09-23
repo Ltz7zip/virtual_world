@@ -1,0 +1,66 @@
+# 分级分辨率配置（见《精度与性能策略》§2.2）
+# nlat = 180 / resolution，nlon = 360 / resolution
+default: medium
+
+levels:
+  preview:
+    resolution: 10.0     # deg
+    nlat: 18
+    nlon: 36
+    cells: 648
+    purpose: 快速预览与参数扫描
+    expected_time: 秒级
+
+  coarse:
+    resolution: 5.0
+    nlat: 36
+    nlon: 72
+    cells: 2592
+    purpose: 气候场初步分析
+    expected_time: 分钟级
+
+  medium:
+    resolution: 2.0
+    nlat: 90
+    nlon: 180
+    cells: 16200
+    purpose: 标准分析
+    expected_time: 十分钟级
+
+  fine:
+    resolution: 1.0
+    nlat: 180
+    nlon: 360
+    cells: 64800
+    purpose: 详细分析
+    expected_time: 小时级
+
+  high:
+    resolution: 0.5
+    nlat: 360
+    nlon: 720
+    cells: 259200
+    purpose: 区域研究
+    expected_time: 数小时
+
+  ultra:
+    resolution: 0.25
+    nlat: 720
+    nlon: 1440
+    cells: 1036800
+    purpose: 局地细节（需要 GPU 集群）
+    expected_time: 数小时以上
+
+# 网格与数值默认值
+grid:
+  type: latlon          # latlon / cubed_sphere / healpix
+  dtype: float32        # GPU 路径统一 Float32
+  lon_center: 0.0       # 经度中心 (deg)，0 表示格林尼治
+  pole_handling: edge   # 纬度边界外推方式：edge / reflect
+
+# 分层复杂度（见《精度与性能策略》§2.1）
+complexity_levels:
+  L0: {model: 纬向平均EBM, state: "T(phi)"}
+  L1: {model: 2D纬向平均环流, state: "T, u, v, q(phi, p)"}
+  L2: {model: 球面浅水/原始方程, state: "u, h, q(lambda, phi)"}
+  L3: {model: 3D原始方程, state: "u, T, q, p_s(lambda, phi, sigma)"}

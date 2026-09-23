@@ -1,0 +1,32 @@
+# 干旱行星：小海洋、薄大气、快自转（气压带更密）、低轴倾角（季节差异弱）
+name: arid
+
+# 几何
+radius: 6.371e6
+flattening: 0.0
+gravity: 9.40            # 略低的重力 → 更厚的标高
+
+# 自转与轨道
+rotation_rate: 1.0e-4    # 自转更快 → 科里奥利力更强，环流带更密集
+axial_tilt: 18.0         # 季节差异弱
+orbital_period: 300.0
+eccentricity: 0.05       # 偏心轨道 → 季节辐射强迫更强
+perihelion_arg: 90.0
+semi_major_axis: 1.35e11
+
+# 恒星
+solar_constant: 1500.0
+stellar_mass: 1.989e30
+
+# 大气
+p_surface: 85000.0       # 稀薄大气
+greenhouse_factor: 0.6   # 温室效应弱
+atm_composition:
+  N2: 0.90
+  O2: 0.05
+  CO2: 0.048
+  H2O: 0.002
+
+# 海洋
+ocean_fraction: 0.15
+ocean_depth_mean: 2500
