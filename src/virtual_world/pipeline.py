@@ -7,7 +7,8 @@
     气候场 → 降水 → 生物群系 → 土壤 → 农业
 
 每一阶段以 :class:`GridState` 为输入输出，通过 :class:`PipelineStage` 协议解耦。
-当前仅核心数据模型已实现；物理阶段会随实施路线图逐个接入并在此注册。
+当前已接入地形三层（:func:`default_stages`，见《地形生成混合方案与程序加速策略》）；
+其余物理阶段会随实施路线图逐个接入并注册。
 """
 
 from __future__ import annotations
@@ -91,6 +92,18 @@ PLANNED_STAGES: list[tuple[str, str]] = [
 ]
 
 
+def default_stages() -> list[PipelineStage]:
+    """已接入实现的默认阶段序列（按因果链顺序）。
+
+    目前仅地形三层（:class:`virtual_world.terrain.stage.TerrainStage`，覆盖
+    :data:`PLANNED_STAGES` 中的 4 个 terrain 条目）已实现；其余阶段仍在
+    :data:`PLANNED_STAGES` 中报告为待实现。
+    """
+    from .terrain.stage import TerrainStage
+
+    return [TerrainStage()]
+
+
 def _log(verbose: bool, message: str) -> None:
     if verbose:
         print(f"[pipeline] {message}")
@@ -116,7 +129,8 @@ def create_world(config: RuntimeConfig) -> tuple[GridState, list[StageResult]]:
     )
 
     results: list[StageResult] = []
-    for stage in config.stages:
+    stages = list(config.stages) if config.stages else default_stages()
+    for stage in stages:
         result = _run_stage(stage, state, config)
         results.append(result)
         _log(config.verbose, f"  {result.status.value:<16} {result.name}")
@@ -124,7 +138,10 @@ def create_world(config: RuntimeConfig) -> tuple[GridState, list[StageResult]]:
             _log(config.verbose, f"    原因: {result.message}")
             break
     if not config.stages:
+        covered = {key for stage in stages for key in getattr(stage, "covers", ())}
         for module, stage_name in PLANNED_STAGES:
+            if (module, stage_name) in covered:
+                continue
             results.append(
                 StageResult(name=stage_name, status=StageStatus.NOT_IMPLEMENTED, message=f"待实现: {module}/{stage_name}")
             )
@@ -143,6 +160,7 @@ def _run_stage(stage: PipelineStage, state: GridState, config: RuntimeConfig) ->
             name=stage.name,
             status=StageStatus.READY,
             elapsed_s=time.perf_counter() - t0,
+            message=str(getattr(stage, "last_message", "")),
             output_fields=sorted(new_fields),
         )
     except Exception as exc:  # noqa: BLE001 - 阶段失败须记录而非中断整个管线
@@ -168,6 +186,8 @@ def world_summary(state: GridState, results: list[StageResult]) -> str:
         extra = ""
         if r.status is StageStatus.READY:
             extra = f" ({r.elapsed_s:.2f}s) 产出[{', '.join(r.output_fields) or '无'}]"
+            if r.message:
+                extra += f"  {r.message}"
         elif r.status is StageStatus.FAILED:
             extra = f" -> {r.message}"
         lines.append(f"  {r.status.value:<16} {r.name}{extra}")
@@ -181,5 +201,6 @@ __all__ = [
     "StageResult",
     "StageStatus",
     "create_world",
+    "default_stages",
     "world_summary",
 ]

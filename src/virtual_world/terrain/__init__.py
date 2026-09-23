@@ -3,18 +3,44 @@
 板块构造模拟 → 噪声与域扭曲精修 → 水力/热力侵蚀 → 河流网络
 （见《地形生成混合方案与程序加速策略》）。
 
-当前实现范围：**第一层 板块构造模拟** 与 **第二层 噪声与扩散精修**。
+当前实现范围：**第一层 板块构造模拟**、**第二层 噪声与扩散精修**与
+**第三层 侵蚀模拟**。
 - :mod:`virtual_world.terrain.voronoi`          球面域扭曲 Voronoi 板块划分
-- :mod:`virtual_world.terrain.euler_poles`      欧拉极点与板块运动学
-- :mod:`virtual_world.terrain.isostasy`         Airy 均衡与地壳厚度演化（Numba）
+- :mod:`virtual_world.terrain.euler_poles`      欧拉极点、板块运动学、四元数与角动量守恒
+- :mod:`virtual_world.terrain.isostasy`         Airy 均衡、地壳厚度演化、质量守恒与造山带高宽比（Numba）
 - :mod:`virtual_world.terrain.plate_tectonics`  板块构造完整管线编排
-- :mod:`virtual_world.terrain.noise_refine`     噪声精修（fBm/域扭曲/残差融合）
-- :mod:`virtual_world.terrain.diffusion`        扩散精修（条件通道/tile/约束/三频带融合）
+- :mod:`virtual_world.terrain.noise_refine`     噪声精修（fBm 八度去相关/域扭曲+边界引导/残差融合）
+- :mod:`virtual_world.terrain.diffusion`        扩散精修（条件通道/选核图/初始噪声/tile/约束/三频带融合）
+- :mod:`virtual_world.terrain.hydraulic_erosion` 虚拟管道水力侵蚀（Numba，Shields 阈值）
+- :mod:`virtual_world.terrain.thermal_erosion`  休止角热力侵蚀与坡面扩散（线性/非线性，Numba）
+- :mod:`virtual_world.terrain.hydrology`        洼地填充 / D8 流向 / 汇流累积 / 河网
+- :mod:`virtual_world.terrain.erosion`          第三层侵蚀完整管线编排与校验
+- :mod:`virtual_world.terrain.landscape_evolution` §2.1 河流功率定律 + §2.2 景观演化方程（Ma 尺度）
+- :mod:`virtual_world.terrain.jax_kernels`      §6.4 JAX 长时积分内核（可选依赖）
+- :mod:`virtual_world.terrain.stage`            :class:`TerrainStage`：三层接入生产管线
+
+网格：第 1 层（板块构造）同时支持**经纬网格**与**立方球网格**（方案 §1.5）——
+``generate_tectonic_field(grid="cubed_sphere", n_side=...)`` 在立方球上生成，
+``regrid_tectonic_result`` 插值回经纬网格供下游与 :class:`~virtual_world.core.grid.GridState` 使用；
+网格见 :class:`virtual_world.core.cubed_sphere.CubedSphere`。
 """
 
 from __future__ import annotations
 
-from . import diffusion, euler_poles, isostasy, noise_refine, voronoi
+from . import (
+    diffusion,
+    erosion,
+    euler_poles,
+    hydraulic_erosion,
+    hydrology,
+    isostasy,
+    jax_kernels,
+    landscape_evolution,
+    noise_refine,
+    stage,
+    thermal_erosion,
+    voronoi,
+)
 from .diffusion import (
     ConditionChannels,
     ConditionsCache,
@@ -31,12 +57,78 @@ from .diffusion import (
     refine_diffusion,
     validate_constraints,
 )
-from .euler_poles import BoundaryType, pick_euler_poles
-from .isostasy import airy_elevation, integrate_crust_thickness
+from .erosion import (
+    DEFAULT_HILLSLOPE_DT_S,
+    DEFAULT_HILLSLOPE_KAPPA,
+    DEFAULT_HYDRAULIC_STEPS,
+    DEFAULT_PRECIPITATION_M_PER_S,
+    ErosionResult,
+    simulate_erosion,
+    validate_erosion,
+)
+from .euler_poles import (
+    BoundaryType,
+    cap_angular_radius,
+    cap_moment_of_inertia,
+    collision_kinetic_budget,
+    integrate_rotation,
+    merge_angular_momentum,
+    pick_euler_poles,
+    quat_from_axis_angle,
+    quat_multiply,
+    quat_omega,
+    quat_rotate,
+)
+from .hydraulic_erosion import (
+    HydraulicErosionResult,
+    advect_sediment,
+    critical_velocity_from_shields,
+    hydraulic_erode,
+    shields_critical_shear,
+)
+from .hydrology import (
+    D8_CODES,
+    D8_OFFSETS,
+    DEFAULT_RIVER_CELLS,
+    HydrologyResult,
+    analyze_hydrology,
+    drainage_area,
+    extract_river_network,
+    fill_pits,
+    flow_accumulation,
+    flow_directions,
+    river_width,
+)
+from .isostasy import (
+    airy_elevation,
+    crust_from_shortening,
+    integrate_crust_thickness,
+    mass_conserving_thickness,
+    max_shortening_factor,
+    orogen_aspect_ratio,
+    ridge_half_width_km,
+    shortening_distance_km,
+    shortening_factor,
+)
+from .jax_kernels import integrate_crust_thickness_jax, jax_available
+from .landscape_evolution import (
+    DEFAULT_K,
+    DEFAULT_KAPPA_M2_PER_MA,
+    DEFAULT_M,
+    DEFAULT_N,
+    LandscapeEvolutionResult,
+    landscape_evolve,
+    stream_power_incision,
+)
 from .noise_refine import (
+    BOUNDARY_GUIDANCE,
+    OCTAVE_ROTATION_DEG,
     Kernel,
     NoiseRefineResult,
+    boundary_distance_field,
+    boundary_guidance_offset,
     fbm_noise,
+    octave_rotation_matrix,
     refine_noise,
     ridged_noise,
     select_noise_kernel,
@@ -46,55 +138,183 @@ from .noise_refine import (
     worley_noise,
 )
 from .plate_tectonics import (
+    CONTINUOUS_TECTONIC_FIELDS,
+    DEFAULT_OCEAN_FRACTION,
+    DISCRETE_TECTONIC_FIELDS,
     REF_CRUST_KM,
     RELAXATION_RATE,
     THICKENING_EFFICIENCY,
     THINNING_EFFICIENCY,
+    TRENCH_DEPTH_MIN,
+    CollisionResult,
     TectonicFieldResult,
+    boundary_index_pairs,
+    boundary_pairs,
+    collide_plates,
+    convergence_distance_km,
+    convergence_factor,
     generate_tectonic_field,
+    mass_conservation_beta,
+    ocean_floor_depth,
+    plate_crust_types,
+    plate_length_scale_km,
+    regrid_tectonic_result,
+    trench_depth,
+    volcanic_arc_uplift,
 )
-from .voronoi import assign_plates, fibonacci_sphere, merge_micro_plates
+from .stage import (
+    COASTLINE_EPS,
+    COVERS,
+    OUTPUT_FIELDS,
+    TerrainStage,
+)
+from .thermal_erosion import (
+    MAX_DIFFUSION_AMPLIFICATION,
+    ThermalErosionResult,
+    hillslope_diffusion,
+    slope_field,
+    thermal_erode,
+)
+from .voronoi import (
+    assign_plates,
+    connected_components,
+    ensure_connected,
+    fibonacci_sphere,
+    latlon_neighbours,
+    merge_micro_plates,
+    plate_angular_radius,
+)
 
 __all__ = [
+    "BOUNDARY_GUIDANCE",
     "BoundaryType",
+    "COASTLINE_EPS",
+    "CONTINUOUS_TECTONIC_FIELDS",
+    "COVERS",
+    "CollisionResult",
     "ConditionChannels",
     "ConditionsCache",
+    "D8_CODES",
+    "D8_OFFSETS",
+    "DEFAULT_HILLSLOPE_DT_S",
+    "DEFAULT_HILLSLOPE_KAPPA",
+    "DEFAULT_HYDRAULIC_STEPS",
+    "DEFAULT_K",
+    "DEFAULT_KAPPA_M2_PER_MA",
+    "DEFAULT_M",
+    "DEFAULT_N",
+    "DEFAULT_OCEAN_FRACTION",
+    "DEFAULT_PRECIPITATION_M_PER_S",
+    "DEFAULT_RIVER_CELLS",
+    "DISCRETE_TECTONIC_FIELDS",
     "DiffusionRefineResult",
     "DiffusionRefiner",
+    "ErosionResult",
+    "HydraulicErosionResult",
+    "HydrologyResult",
     "Kernel",
+    "LandscapeEvolutionResult",
+    "MAX_DIFFUSION_AMPLIFICATION",
     "NoiseRefineResult",
+    "OCTAVE_ROTATION_DEG",
+    "OUTPUT_FIELDS",
     "REF_CRUST_KM",
     "RELAXATION_RATE",
     "StructuredDiffusionRefiner",
     "THICKENING_EFFICIENCY",
     "THINNING_EFFICIENCY",
+    "TRENCH_DEPTH_MIN",
     "TectonicFieldResult",
     "TerrainDiffusionRefiner",
+    "TerrainStage",
+    "ThermalErosionResult",
     "TileConditions",
+    "advect_sediment",
     "airy_elevation",
+    "analyze_hydrology",
     "assign_plates",
+    "boundary_distance_field",
+    "boundary_guidance_offset",
+    "boundary_index_pairs",
+    "boundary_pairs",
     "build_condition_channels",
+    "cap_angular_radius",
+    "cap_moment_of_inertia",
+    "collide_plates",
+    "collision_kinetic_budget",
+    "connected_components",
+    "convergence_distance_km",
+    "convergence_factor",
+    "critical_velocity_from_shields",
+    "crust_from_shortening",
     "d8_flow_accumulation",
     "diffusion",
+    "drainage_area",
     "enforce_residual_constraints",
+    "ensure_connected",
+    "erosion",
     "euler_poles",
+    "extract_river_network",
     "fbm_noise",
     "fibonacci_sphere",
+    "fill_pits",
+    "flow_accumulation",
+    "flow_directions",
     "frequency_merge",
     "frequency_windows",
     "generate_tectonic_field",
+    "hillslope_diffusion",
+    "hydraulic_erode",
+    "hydraulic_erosion",
+    "hydrology",
     "integrate_crust_thickness",
+    "integrate_crust_thickness_jax",
+    "integrate_rotation",
     "isostasy",
+    "jax_available",
+    "jax_kernels",
+    "landscape_evolution",
+    "landscape_evolve",
+    "latlon_neighbours",
+    "mass_conservation_beta",
+    "mass_conserving_thickness",
+    "max_shortening_factor",
+    "merge_angular_momentum",
     "merge_micro_plates",
     "noise_refine",
+    "octave_rotation_matrix",
+    "ocean_floor_depth",
+    "orogen_aspect_ratio",
     "pick_euler_poles",
+    "plate_angular_radius",
+    "plate_crust_types",
+    "plate_length_scale_km",
+    "quat_from_axis_angle",
+    "quat_multiply",
+    "quat_omega",
+    "quat_rotate",
     "refine_diffusion",
     "refine_noise",
+    "regrid_tectonic_result",
+    "ridge_half_width_km",
     "ridged_noise",
+    "river_width",
     "select_noise_kernel",
+    "shields_critical_shear",
+    "shortening_distance_km",
+    "shortening_factor",
     "simplex_noise",
+    "simulate_erosion",
+    "slope_field",
+    "stage",
+    "stream_power_incision",
+    "thermal_erode",
+    "thermal_erosion",
+    "trench_depth",
     "turbulence_noise",
     "validate_constraints",
+    "validate_erosion",
+    "volcanic_arc_uplift",
     "voronoi",
     "warped_noise",
     "worley_noise",
