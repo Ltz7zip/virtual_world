@@ -119,3 +119,27 @@ def test_latitude_of_max() -> None:
     lat = spherical.lat_centers(90)
     profile = np.exp(-((lat / 20.0) ** 2))
     assert spherical.latitude_of_max(profile, lat) == pytest.approx(-1.0, abs=1.0)
+
+
+def test_cell_spacing_metric() -> None:
+    """纬向格距恒定，经向格距随 cos(lat) 向极点收缩。"""
+    radius = const.EARTH_RADIUS
+    nlat, nlon = 18, 36
+    lat = spherical.lat_centers(nlat)
+    dlat_m, dlon_m = spherical.cell_spacing(lat, nlon, radius)
+    assert dlat_m == pytest.approx(np.deg2rad(180.0 / nlat) * radius)
+    assert dlon_m.shape == (nlat,)
+    assert np.allclose(dlon_m, dlat_m * np.cos(np.deg2rad(lat)))
+    # 经向格距在赤道最大、向两极单调收缩
+    assert np.all(dlon_m <= dlat_m + 1e-9)
+    assert int(np.argmax(dlon_m)) in (nlat // 2 - 1, nlat // 2)
+
+
+def test_cell_spacing_matches_cell_area() -> None:
+    """纬向格距 × 经向格距 ≈ 单元面积（小角度近似，相对误差 O(dlat²)）。"""
+    radius = const.EARTH_RADIUS
+    nlat, nlon = 180, 360
+    lat = spherical.lat_centers(nlat)
+    dlat_m, dlon_m = spherical.cell_spacing(lat, nlon, radius)
+    areas = spherical.cell_areas(spherical.lat_edges(nlat), nlon, radius)[:, 0]
+    assert np.allclose(dlat_m * dlon_m, areas, rtol=1e-4)

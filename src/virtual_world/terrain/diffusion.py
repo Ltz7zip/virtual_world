@@ -81,15 +81,22 @@ class DiffusionRefiner(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class ConditionChannels:
-    """扩散精修的四路条件信号（§3.2）。"""
+    """扩散精修的输入条件信号（§3.2 的四路 + §1.3 的选核图）。
+
+    ``lowpass`` / ``land_mask`` / ``boundary_distance`` / ``river_network`` 构成方案
+    §3.2 的**四路模型输入通道**（见 :meth:`stack`）。``kernel_map`` 是按 §1.3 分配
+    策略表逐单元选出的噪声核标签，供内置精修器保持与噪声基底一致的构造纹理；
+    它不是扩散模型的输入通道，因此不参与 :meth:`stack`。
+    """
 
     lowpass: np.ndarray  # 通道 1：构造高程低频分量
     land_mask: np.ndarray  # 通道 2：海陆掩码
     boundary_distance: np.ndarray  # 通道 3：到板块边界距离场
     river_network: np.ndarray  # 通道 4：河流网络掩码
+    kernel_map: np.ndarray  # §1.3 选核图（辅助，不属于模型输入通道）
 
     def stack(self) -> np.ndarray:
-        """堆叠为 ``(4, nlat, nlon)``，供模型多通道输入（§2.2）。"""
+        """堆叠为 ``(4, ...)``，供模型多通道输入（§3.2）。"""
         return np.stack(
             [
                 np.asarray(self.lowpass, dtype=np.float64),
@@ -235,6 +242,7 @@ def build_condition_channels(
         land_mask=land_mask,
         boundary_distance=bdist,
         river_network=rivers,
+        kernel_map=nr.select_noise_kernel(bt, tec),
     )
 
 
@@ -261,21 +269,28 @@ def _save_conditions(path: Path, channels: ConditionChannels) -> None:
     group = zarr.open_group(str(path), mode="w")
     group.create_array("lowpass", data=np.asarray(channels.lowpass, dtype=np.float64))
     group.create_array("land_mask", data=np.asarray(channels.land_mask, dtype=bool))
-    group.create_array("boundary_distance", data=np.asarray(channels.boundary_distance, dtype=np.float64))
+    group.create_array(
+        "boundary_distance", data=np.asarray(channels.boundary_distance, dtype=np.float64)
+    )
     group.create_array("river_network", data=np.asarray(channels.river_network, dtype=bool))
+    group.create_array("kernel_map", data=np.asarray(channels.kernel_map, dtype=np.int32))
 
 
 def _load_conditions(path: Path) -> ConditionChannels | None:
+    """读回缓存；缺任一字段（如旧版本写的缓存）时视为未命中。"""
     if not path.exists():
         return None
     import zarr
 
     group: Any = zarr.open_group(str(path), mode="r")
+    if any(name not in group for name in ("lowpass", "land_mask", "boundary_distance", "river_network", "kernel_map")):
+        return None
     return ConditionChannels(
         lowpass=np.asarray(group["lowpass"][:], dtype=np.float64),
         land_mask=np.asarray(group["land_mask"][:], dtype=bool),
         boundary_distance=np.asarray(group["boundary_distance"][:], dtype=np.float64),
         river_network=np.asarray(group["river_network"][:], dtype=bool),
+        kernel_map=np.asarray(group["kernel_map"][:], dtype=np.int32),
     )
 
 
@@ -458,7 +473,9 @@ def validate_constraints(
             problems.append(f"支撑集均值约束违反: |mean|={mean_land:.3e} > {mean_rtol * scale:.3e}")
         lowfreq = np.abs(_masked_block_mean(r, land, block)).max()
         if lowfreq > lowfreq_rtol * scale:
-            problems.append(f"低频截断约束违反: |块均值|max={lowfreq:.3e} > {lowfreq_rtol * scale:.3e}")
+            problems.append(
+                f"低频截断约束违反: |块均值|max={lowfreq:.3e} > {lowfreq_rtol * scale:.3e}"
+            )
     if coast.any():
         # 方案 §3.3：海岸线处约束的是最终高程 H_final，而非仅残差——海陆边界
         # 必须留在构造层设定的位置，否则细节层会推移岸线。
@@ -499,7 +516,9 @@ def frequency_windows(
     ``w_mid = 1 - w_low - w_high``，因此三者严格构成单位分解，过渡带为余弦窗。
     """
     if not (0.0 < k_low <= k_mid <= k_high):
-        raise ValueError(f"频带截断必须满足 0 < k_low <= k_mid <= k_high，实际 {k_low}, {k_mid}, {k_high}")
+        raise ValueError(
+            f"频带截断必须满足 0 < k_low <= k_mid <= k_high，实际 {k_low}, {k_mid}, {k_high}"
+        )
     k = _radial_wavenumber(shape)
     w_low = _cosine_step(k, k_low, k_mid)
     w_high = 1.0 - _cosine_step(k, k_mid, k_high)
@@ -544,6 +563,8 @@ class TileConditions:
     land_mask: np.ndarray
     boundary_distance: np.ndarray
     river_network: np.ndarray
+    kernel_map: np.ndarray  # §1.3 选核图（与噪声基底一致的构造纹理）
+    init_noise: np.ndarray  # §5.2 第 2 步：扩散采样的初始噪声
     xyz: np.ndarray  # (h, w, 3) 全局球面坐标
 
     @classmethod
@@ -553,19 +574,32 @@ class TileConditions:
         tectonic: np.ndarray,
         channels: ConditionChannels,
         coords: np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray],
+        noise: np.ndarray | None = None,
     ) -> TileConditions:
-        """从全局场切出该 tile 的条件（``coords`` 可为 ``(nlat,nlon,3)`` 或三元组）。"""
+        """从全局场切出该 tile 的条件（``coords`` 可为 ``(..., 3)`` 或三元组）。
+
+        ``noise`` 为方案 §5.2 第 2 步的初始噪声（fBm + 域扭曲结果）；None 时为零场，
+        表示精修器自行合成细节。
+        """
         sl = (slice(tile.i0, tile.i1), slice(tile.j0, tile.j1))
         if isinstance(coords, tuple):
             coords = np.stack(coords, axis=-1)
         xyz = np.asarray(coords, dtype=np.float64)[sl]
+        tectonic_tile = np.asarray(tectonic, dtype=np.float64)[sl]
+        init_noise = (
+            np.zeros_like(tectonic_tile)
+            if noise is None
+            else np.asarray(noise, dtype=np.float64)[sl]
+        )
         return cls(
             tile=tile,
-            tectonic=np.asarray(tectonic, dtype=np.float64)[sl],
+            tectonic=tectonic_tile,
             lowpass=np.asarray(channels.lowpass, dtype=np.float64)[sl],
             land_mask=np.asarray(channels.land_mask, dtype=bool)[sl],
             boundary_distance=np.asarray(channels.boundary_distance, dtype=np.float64)[sl],
             river_network=np.asarray(channels.river_network, dtype=bool)[sl],
+            kernel_map=np.asarray(channels.kernel_map, dtype=np.int32)[sl],
+            init_noise=init_noise,
             xyz=xyz,
         )
 
@@ -574,8 +608,13 @@ class StructuredDiffusionRefiner:
     """内置确定性结构化精修器（§5.2 可独立使用的精修层）。
 
     不依赖任何外部模型：用 3D 球面噪声合成高平细节，并按条件通道调制——
-    造山带（靠近板块边界）振幅更大、河网处下切、海陆使用不同噪声核。
-    输出只依赖全局坐标与条件切片，因此重叠 tile 逐点一致。
+    造山带（靠近板块边界）振幅更大、河网处下切、**按 §1.3 分配策略表逐单元选核**
+    （与噪声基底同源，因此两条第二层路径的纹理一致）。
+
+    方案 §5.2 第 2 步要求"用 fBm + 域扭曲结果作为扩散采样的初始噪声"：给定
+    ``conditions.init_noise`` 时直接以它作为细节基底（不再合成），否则回退到
+    自身合成的 Ridged/Simplex 细节。两种情形都**只依赖逐点条件与全局坐标**，
+    因此重叠 tile 逐点一致（不做 tile 内归一化，否则会撕出接缝）。
     """
 
     def __init__(
@@ -587,6 +626,7 @@ class StructuredDiffusionRefiner:
         boundary_gain: float = 0.8,
         boundary_decay: float = 6.0,
         river_carve: float = 0.6,
+        warp_amp: float = nr.WARP_AMP,
     ) -> None:
         self.amplitude = float(amplitude)
         self.freq_scale = float(freq_scale)
@@ -594,24 +634,38 @@ class StructuredDiffusionRefiner:
         self.boundary_gain = float(boundary_gain)
         self.boundary_decay = float(boundary_decay)
         self.river_carve = float(river_carve)
+        self.warp_amp = float(warp_amp)
 
     def refine_tile(self, conditions: TileConditions, seed: int) -> np.ndarray:
         xyz = conditions.xyz
         s = self.freq_scale
         x, y, z = xyz[..., 0] * s, xyz[..., 1] * s, xyz[..., 2] * s
 
-        # 陆地用 ridged（山脊尖锐），海洋用 fBm（平缓海底纹理）
-        ridged = nr.ridged_noise(x, y, z, seed=seed * 7 + 1, octaves=self.octaves) - 0.5
-        smooth = nr.fbm_noise(x, y, z, seed=seed * 7 + 2, octaves=self.octaves)
-        # 不在此处做 tile 内均值扣除：均值由管线在拼接后统一强制，
-        # 且逐 tile 扣均值会破坏重叠区的一致性（接缝）。
-        detail = np.where(conditions.land_mask, ridged, smooth)
+        # §1.3 分配策略表：造山带 Ridged、洋中脊 Worley、海沟 Turbulence、其余 Simplex
+        ridged = nr.build_kernel_fields(
+            x,
+            y,
+            z,
+            seed * 7 + 1,
+            np.asarray(conditions.kernel_map, dtype=np.int32),
+            octaves=self.octaves,
+            warp_amp=self.warp_amp,
+        )
+
+        # §5.2 第 2 步：有初始噪声时以它作为细节基底（扩散采样从统计合理的起点开始）
+        init_noise = np.asarray(conditions.init_noise, dtype=np.float64)
+        if np.any(init_noise != 0.0):
+            detail = init_noise
+            amplitude = 1.0  # 初始噪声已由上游标定，不再乘振幅
+        else:
+            detail = ridged
+            amplitude = self.amplitude
 
         # 条件通道 3：边界距离场控制振幅——造山带更陡峭
         gain = 1.0 + self.boundary_gain * np.exp(
             -np.asarray(conditions.boundary_distance) / self.boundary_decay
         )
-        field = self.amplitude * detail * gain
+        field = amplitude * detail * gain
 
         # 条件通道 4：河网下切（负向）
         field = field - self.river_carve * self.amplitude * conditions.river_network
@@ -662,12 +716,18 @@ class TerrainDiffusionRefiner:
                 f"请先在线下载权重，或改用 StructuredDiffusionRefiner"
             )
         device = self.device or ("mps" if torch.backends.mps.is_available() else "cpu")
-        pipe = DiffusionPipeline.from_pretrained(self.model_id, torch_dtype=getattr(torch, self.dtype))
+        pipe = DiffusionPipeline.from_pretrained(
+            self.model_id, torch_dtype=getattr(torch, self.dtype)
+        )
         self._pipeline = pipe.to(device)
         return self._pipeline
 
     def refine_tile(self, conditions: TileConditions, seed: int) -> np.ndarray:
-        """以条件通道为 ControlNet 输入做去噪，返回残差 tile（§2.2、§3.3）。"""
+        """以条件通道为条件输入做去噪，返回残差 tile（§3.2、§3.3、§5.2）。
+
+        方案 §5.2 第 2 步：把该 tile 的 fBm + 域扭曲结果作为扩散采样的**初始噪声**
+        （``latents``），而不是纯高斯噪声——采样从统计合理的起点开始，可减少步数。
+        """
         pipe = self._load()
         import torch
 
@@ -681,12 +741,16 @@ class TerrainDiffusionRefiner:
             axis=0,
         )
         generator = torch.Generator(device="cpu").manual_seed(int(seed) & 0x7FFFFFFF)
+        init_noise = np.asarray(conditions.init_noise, dtype=np.float64)
+        kwargs: dict[str, Any] = {
+            "image": torch.from_numpy(cond).unsqueeze(0).float(),
+            "num_inference_steps": self.steps,
+            "generator": generator,
+        }
+        if np.any(init_noise != 0.0):
+            kwargs["latents"] = torch.from_numpy(init_noise)[None, None, ...].float()
         with torch.no_grad():
-            out = pipe(
-                image=torch.from_numpy(cond).unsqueeze(0).float(),
-                num_inference_steps=self.steps,
-                generator=generator,
-            ).images[0]
+            out = pipe(**kwargs).images[0]
         arr = np.asarray(out, dtype=np.float64)
         if arr.ndim == 3:
             arr = arr.mean(axis=-1)
@@ -735,10 +799,11 @@ def refine_diffusion(
     """扩散精修完整管线（§6 伪代码 1–8）。
 
     参数：
-        tectonic: 构造层高程 H_tectonic（m）
+        tectonic: 构造层高程 H_tectonic（m），形状 ``(nlat, nlon)``
         boundary_type: 板块边界类型场（:class:`euler_poles.BoundaryType` 像素值）
         seed: 确定性种子（同时驱动精修器）
-        noise: 中频噪声基底 H_noise；None 时该频带无贡献（§5.2 可省略）
+        noise: 中频噪声基底 H_noise；None 时该频带无贡献（§5.2 可省略）。
+            同时作为 §5.2 第 2 步的**扩散采样初始噪声**传给精修器。
         refiner: 精修器；None 时用 :class:`StructuredDiffusionRefiner`
         tile_size / overlap: tile 划分（§4.2 批量推理）
         block: 低频截断的块尺度
@@ -750,6 +815,12 @@ def refine_diffusion(
 
     返回 :class:`DiffusionRefineResult`；约束由管线强制，可用
     :func:`validate_constraints` 独立复核。
+
+    网格限制：本路径的 tile 划分与三频带融合都建立在**矩形周期网格**上
+    （``np.fft.fft2`` 沿最后两轴做频带分离，文档字符串见 :func:`frequency_merge`），
+    因此只接受 ``(nlat, nlon)``。立方球网格请走 :func:`noise_refine.refine_noise`
+    （噪声路径已支持 ``(6, n, n)``），或用
+    :func:`plate_tectonics.regrid_tectonic_result` 先插值回经纬网格。
     """
     if seed < 0:
         raise ValueError(f"seed 不能为负，实际为 {seed}")
@@ -757,6 +828,11 @@ def refine_diffusion(
     bt = np.asarray(boundary_type, dtype=np.int32)
     if tec.shape != bt.shape:
         raise ValueError(f"tectonic 与 boundary_type 形状不一致: {tec.shape} vs {bt.shape}")
+    if tec.ndim != 2:
+        raise ValueError(
+            f"扩散精修仅支持 (nlat, nlon) 经纬网格，实际 {tec.shape}；"
+            "立方球网格请用 noise_refine.refine_noise，或先 regrid_tectonic_result 转回经纬网格"
+        )
     nlat, nlon = tec.shape
 
     # 2–3：条件信号预计算（§6 第 3 步）
@@ -775,12 +851,21 @@ def refine_diffusion(
         key = condition_cache_key(tec, bt, block=block, river_threshold=river_threshold)
         conditions = cache.get_or_build(key, _build)
 
+    # 中频噪声基底（§5.1 的中频带 + §5.2 第 2 步的初始噪声，同一个场）
+    noise_field = np.zeros_like(tec) if noise is None else np.asarray(noise, dtype=np.float64)
+    if noise_field.shape != tec.shape:
+        raise ValueError(f"noise 形状 {noise_field.shape} 与构造场 {tec.shape} 不一致")
+
     # 4：逐 tile 条件去噪（§6 第 4a–4d 步）
-    active_refiner: DiffusionRefiner = refiner if refiner is not None else StructuredDiffusionRefiner()
+    active_refiner: DiffusionRefiner = (
+        refiner if refiner is not None else StructuredDiffusionRefiner()
+    )
     coords = sphere_coords(nlat, nlon, scale=coords_scale)
     tiles = iter_tiles(nlat, nlon, tile_size, overlap)
     pieces = [
-        active_refiner.refine_tile(TileConditions.from_global(t, tec, conditions, coords), seed=seed)
+        active_refiner.refine_tile(
+            TileConditions.from_global(t, tec, conditions, coords, noise_field), seed=seed
+        )
         for t in tiles
     ]
 
@@ -789,12 +874,7 @@ def refine_diffusion(
     residual = enforce_residual_constraints(stitched, tec, block=block, coastline_eps=coastline_eps)
 
     # 6：三频带融合（§5.1）
-    noise_field = np.zeros_like(tec) if noise is None else np.asarray(noise, dtype=np.float64)
-    if noise_field.shape != tec.shape:
-        raise ValueError(f"noise 形状 {noise_field.shape} 与构造场 {tec.shape} 不一致")
-    elevation = frequency_merge(
-        tec, noise_field, residual, k_low=k_low, k_mid=k_mid, k_high=k_high
-    )
+    elevation = frequency_merge(tec, noise_field, residual, k_low=k_low, k_mid=k_mid, k_high=k_high)
 
     # 7：海岸线钳制（§3.3）——方案约束的是 H_final 而非仅残差。频域融合是
     # 全局算子，会在岸线处引入中高频偏移；钳制把岸线钉回构造层设定位置，

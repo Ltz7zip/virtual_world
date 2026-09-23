@@ -14,7 +14,9 @@ def test_same_seed_gives_same_sequence() -> None:
     a = DeterministicRNG(42)
     b = DeterministicRNG(42)
     assert np.array_equal(a.normal(size=10), b.normal(size=10))
-    assert not np.array_equal(DeterministicRNG(42).normal(size=10), DeterministicRNG(43).normal(size=10))
+    assert not np.array_equal(
+        DeterministicRNG(42).normal(size=10), DeterministicRNG(43).normal(size=10)
+    )
 
 
 def test_derive_seed_is_hash_based() -> None:
@@ -28,7 +30,9 @@ def test_spawn_is_order_independent() -> None:
     climate = DeterministicRNG(7).spawn("climate")
     assert terrain.seed != climate.seed
     assert DeterministicRNG(7).spawn("climate").seed == climate.seed
-    assert np.array_equal(terrain.normal(size=5), DeterministicRNG(7).spawn("terrain").normal(size=5))
+    assert np.array_equal(
+        terrain.normal(size=5), DeterministicRNG(7).spawn("terrain").normal(size=5)
+    )
 
 
 def test_state_roundtrip() -> None:

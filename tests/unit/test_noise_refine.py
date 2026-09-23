@@ -8,7 +8,9 @@ import pytest
 from virtual_world.terrain import noise_refine as nr
 
 
-def _xyz_grid(nlat: int, nlon: int, scale: float = 4.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _xyz_grid(
+    nlat: int, nlon: int, scale: float = 4.0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """单位球面上的 3D 噪声输入坐标（《第二层完善》§4.1）。"""
     lat = -90.0 + (180.0 / nlat) * (np.arange(nlat) + 0.5)
     lon = -180.0 + (360.0 / nlon) * (np.arange(nlon) + 0.5)
@@ -258,3 +260,207 @@ def test_boundary_distance_field_all_transform_ok() -> None:
     btype = np.full((8, 16), BoundaryType.TRANSFORM, dtype=np.int32)
     dist = nr.boundary_distance_field(btype)
     assert np.all(np.isfinite(dist))
+
+
+# ===== §1.2 八度去相关（旋转矩阵） =====
+
+
+def test_octave_rotation_matrix_is_proper_rotation() -> None:
+    """八度去相关矩阵是正交、行列式 +1 的旋转，角度等于方案示例的 36.87°。"""
+    r = nr.octave_rotation_matrix()
+    assert np.allclose(r.T @ r, np.eye(3), atol=1e-12)
+    assert np.linalg.det(r) == pytest.approx(1.0, abs=1e-12)
+    angle = np.rad2deg(np.arccos((np.trace(r) - 1.0) / 2.0))
+    assert angle == pytest.approx(nr.OCTAVE_ROTATION_DEG, rel=1e-9)
+    assert not np.allclose(r, np.eye(3))
+
+
+def test_octave_rotation_rejects_zero_axis() -> None:
+    with pytest.raises(ValueError):
+        nr.octave_rotation_matrix(axis=(0.0, 0.0, 0.0))
+
+
+def test_fbm_matches_reference_with_per_octave_rotation() -> None:
+    """fBm = 同一 seed + 逐八度坐标乘旋转矩阵（§1.2 的机制，逐位复现）。
+
+    注意：旋转带来的是**去相关**（避免八度频率对齐产生的晶格伪影），而不是改变
+    线性相关系数——本实现用散列梯度，八度间相关性本就很低，因此这里校验的是
+    "机制被正确执行"，而不是某个相关性阈值。
+    """
+    x, y, z = _xyz_grid(24, 48)
+
+    def reference(rotate: bool) -> np.ndarray:
+        total = np.zeros_like(x)
+        px, py, pz = x, y, z
+        amp, freq, norm = 1.0, 1.0, 0.0
+        for _ in range(5):
+            total += amp * nr.simplex_noise(px * freq, py * freq, pz * freq, seed=9)
+            norm += amp
+            if rotate:
+                px, py, pz = nr._rotate_octave_coords(px, py, pz)
+            amp *= nr.PERSISTENCE
+            freq *= nr.LACUNARITY
+        return total / norm
+
+    out = nr.fbm_noise(x, y, z, seed=9, octaves=5)
+    assert np.allclose(out, reference(rotate=True), atol=1e-12)
+    assert not np.allclose(out, reference(rotate=False))
+
+
+def test_rotate_octave_coords_preserves_shape_and_radius() -> None:
+    x, y, z = _xyz_grid(8, 16)
+    rx, ry, rz = nr._rotate_octave_coords(x, y, z)
+    assert rx.shape == x.shape
+    assert np.allclose(np.sqrt(rx**2 + ry**2 + rz**2), np.sqrt(x**2 + y**2 + z**2))
+
+
+# ===== §2.3 边界距离引导 =====
+
+
+def test_boundary_guidance_zero_without_real_boundary() -> None:
+    """无汇聚/离散边界时引导项为零（等价于不引导）。"""
+    from virtual_world.terrain.euler_poles import BoundaryType
+
+    x, y, z = _xyz_grid(16, 32)
+    for code in (BoundaryType.TRANSFORM, BoundaryType.INTERIOR):
+        btype = np.full((16, 32), code, dtype=np.int32)
+        gx, gy, gz = nr.boundary_guidance_offset(btype, x, y, z)
+        assert np.all(gx == 0.0) and np.all(gy == 0.0) and np.all(gz == 0.0)
+
+
+def test_boundary_guidance_points_away_from_boundary() -> None:
+    """引导方向为"远离边界"：边界以北指向北，以南指向南（§2.3）。"""
+    from virtual_world.terrain.euler_poles import BoundaryType
+
+    nlat, nlon = 24, 48
+    btype = np.full((nlat, nlon), BoundaryType.TRANSFORM, dtype=np.int32)
+    row = nlat // 2
+    btype[row, :] = BoundaryType.CONVERGENT
+    lat = -90.0 + (180.0 / nlat) * (np.arange(nlat) + 0.5)
+    lon = -180.0 + (360.0 / nlon) * (np.arange(nlon) + 0.5)
+    phi, lam = np.deg2rad(lat)[:, None], np.deg2rad(lon)[None, :]
+    cp = np.cos(phi)
+    x = cp * np.cos(lam) * 4.0
+    y = cp * np.sin(lam) * 4.0
+    z = np.sin(phi) * np.ones((nlat, nlon)) * 4.0
+
+    strength, freq_scale = 0.1, 4.0
+    gx, gy, gz = nr.boundary_guidance_offset(
+        btype, x, y, z, strength=strength, freq_scale=freq_scale
+    )
+    magnitude = np.sqrt(gx**2 + gy**2 + gz**2)
+    assert float(magnitude.max()) <= strength * freq_scale * (1.0 + 1e-9)
+    assert float(magnitude.max()) > 0.5 * strength * freq_scale
+
+    # 北向单位切向量
+    unit = np.stack([x, y, z], axis=-1) / np.sqrt(x**2 + y**2 + z**2)[..., None]
+    delta = unit[1:, :] - unit[:-1, :]
+    delta = delta - (delta * unit[:-1, :]).sum(-1, keepdims=True) * unit[:-1, :]
+    north_hat = delta / np.linalg.norm(delta, axis=-1, keepdims=True)
+    dot = (np.stack([gx, gy, gz], axis=-1)[:-1, :] * north_hat).sum(-1)
+
+    rows = np.arange(nlat - 1)
+    assert np.all(dot[rows >= row + 2] > 0.0)
+    assert np.all(dot[rows <= row - 3] < 0.0)
+
+
+def test_boundary_guidance_changes_refined_field() -> None:
+    """开启 §2.3 引导后残差改变（真实汇聚边界在场）。"""
+    from virtual_world.terrain.euler_poles import BoundaryType
+
+    nlat, nlon = 32, 64
+    x, y, z = _xyz_grid(nlat, nlon)
+    tectonic = 2000.0 * nr.simplex_noise(x, y, z, seed=2)
+    btype = np.full((nlat, nlon), BoundaryType.TRANSFORM, dtype=np.int32)
+    btype[nlat // 2, :] = BoundaryType.CONVERGENT
+    btype[nlat // 4, :] = BoundaryType.DIVERGENT
+
+    off = nr.refine_noise(tectonic, btype, seed=5, boundary_guidance=0.0)
+    on = nr.refine_noise(tectonic, btype, seed=5)
+    assert not np.allclose(off.residual, on.residual)
+    assert on.residual.shape == (nlat, nlon)
+    assert abs(float(on.residual.mean())) < 1e-8
+
+
+def test_refine_noise_rejects_negative_guidance() -> None:
+    """负引导强度是输入错误，直接报错而非静默关闭。"""
+    btype = np.zeros((8, 16), dtype=np.int32)
+    with pytest.raises(ValueError):
+        nr.refine_noise(np.zeros((8, 16)), btype, seed=0, boundary_guidance=-1.0)
+
+
+# ===== §4.2 立方球网格 / §4.3 等面积校正 =====
+
+
+def test_refine_noise_on_cubed_sphere() -> None:
+    """立方球 ``(6, n, n)`` 场直接精修：形状、零均值残差、选核图（§4.2）。"""
+    from virtual_world.core.cubed_sphere import CubedSphere
+    from virtual_world.terrain.euler_poles import BoundaryType
+
+    sphere = CubedSphere(16)
+    unit = sphere.centers_xyz()
+    tectonic = 2500.0 * unit[..., 2]
+    btype = np.full(sphere.shape, BoundaryType.TRANSFORM, dtype=np.int32)
+    btype[0, :, :] = BoundaryType.CONVERGENT
+    btype[3, :, :] = BoundaryType.DIVERGENT
+
+    out = nr.refine_noise(tectonic, btype, seed=3, freq_scale=4.0, block=4)
+    assert out.elevation.shape == sphere.shape
+    assert out.residual.shape == sphere.shape
+    assert out.kernel_map.shape == sphere.shape
+    assert np.all(np.isfinite(out.elevation))
+    assert abs(float(out.residual.mean())) < 1e-8
+    assert np.allclose(out.elevation, tectonic + out.residual)
+    # 选核图在 6 个面上都非空（跨面接缝不影响选核）
+    assert set(np.unique(out.kernel_map)) == {
+        int(nr.Kernel.SIMPLEX),
+        int(nr.Kernel.RIDGED),
+        int(nr.Kernel.WORLEY),
+    }
+
+
+def test_refine_noise_rejects_unknown_grid_shape() -> None:
+    with pytest.raises(ValueError):
+        nr.refine_noise(np.zeros((6, 8, 9)), np.zeros((6, 8, 9), dtype=np.int32))
+    with pytest.raises(ValueError):
+        nr.refine_noise(np.zeros((3, 4, 5)), np.zeros((3, 4, 5), dtype=np.int32))
+
+
+def test_area_correction_changes_cubed_sphere_result() -> None:
+    """§4.3 等面积校正在面积不完全均匀的立方球上生效。"""
+    from virtual_world.core.cubed_sphere import CubedSphere
+    from virtual_world.terrain.euler_poles import BoundaryType
+
+    sphere = CubedSphere(16)
+    unit = sphere.centers_xyz()
+    tectonic = 2000.0 * unit[..., 0]
+    btype = np.full(sphere.shape, BoundaryType.TRANSFORM, dtype=np.int32)
+    btype[0, :, :] = BoundaryType.CONVERGENT
+
+    plain = nr.refine_noise(tectonic, btype, seed=4, freq_scale=6.0, boundary_guidance=0.0)
+    corrected = nr.refine_noise(
+        tectonic, btype, seed=4, freq_scale=6.0, boundary_guidance=0.0, area_correction=True
+    )
+    assert corrected.residual.shape == sphere.shape
+    assert np.all(np.isfinite(corrected.elevation))
+    assert not np.allclose(plain.residual, corrected.residual)
+    # 校正因子仅覆盖单元面积比（1.345）的量级：差异不应是数量级级别的爆炸
+    assert float(corrected.residual.std()) < 10.0 * float(plain.residual.std())
+
+
+def test_block_mean_and_expand_tile_support_leading_dims() -> None:
+    """块均值/展开支持前导维（三维场立方球逐面处理）。"""
+    field = np.arange(2 * 12 * 16, dtype=np.float64).reshape(2, 12, 16)
+    coarse = nr.block_mean(field, 4)
+    assert coarse.shape == (2, 3, 4)
+    restored = nr.expand_tile(coarse, 4, field.shape)
+    assert restored.shape == field.shape
+    # 分块常数近似：每 4×4 块的均值应接近原块均值
+    assert np.allclose(restored[:, 0, 0], coarse[:, 0, 0])
+
+
+def test_block_mean_pads_non_divisible_shape() -> None:
+    field = np.arange(18 * 36, dtype=np.float64).reshape(18, 36)
+    coarse = nr.block_mean(field, 4)
+    assert coarse.shape == (5, 9)  # 18→20, 36→36，再除以 4
+    assert nr.expand_tile(coarse, 4, field.shape).shape == field.shape

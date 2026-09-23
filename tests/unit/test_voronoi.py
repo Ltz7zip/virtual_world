@@ -175,3 +175,67 @@ def test_merge_micro_plates_at_least_one_large_plate() -> None:
     counts = np.bincount(merged.ravel())
     largest_frac = counts.max() / counts.sum()
     assert largest_frac > 0.15
+
+
+# ===== 纬向非循环（极点约束）与连通性 =====
+
+
+def test_plate_angular_radius_matches_area_partition() -> None:
+    """板块平均角半径由球面均分面积 4π/N 反解：N 越大半径越小。"""
+    r300 = voronoi.plate_angular_radius(300)
+    r1200 = voronoi.plate_angular_radius(1200)
+    assert r300 > r1200 > 0.0
+    # 球冠面积 2π(1-cos θ) 应等于 4π/N
+    cap = 2.0 * np.pi * (1.0 - np.cos(r300))
+    assert cap == pytest.approx(4.0 * np.pi / 300, rel=1e-12)
+
+
+def test_micro_plate_adjacency_latitude_not_cyclic() -> None:
+    """纬度方向不得循环：南北极行不可互连（core.spherical 约定）。"""
+    field = np.zeros((6, 4), dtype=np.int32)
+    field[3:, :] = 1  # 行 0..2 = 板块 0，行 3..5 = 板块 1
+    shared = voronoi.micro_plate_adjacency(field)
+    # 唯一界面是行 2 / 行 3，共 4 个网格边；若纬度循环会额外多出 4
+    assert shared[0, 1] == 4
+    assert shared[1, 0] == 4
+    assert np.all(np.diag(shared) == 0)
+
+
+def test_micro_plate_adjacency_longitude_is_cyclic() -> None:
+    """经度方向必须循环：跨日期变更线的相邻单元属同一邻接。"""
+    field = np.zeros((4, 6), dtype=np.int32)
+    field[:, 3:] = 1  # 经度前半 = 板块 0，后半 = 板块 1
+    shared = voronoi.micro_plate_adjacency(field)
+    # 两处界面（列 2/3 与列 5/0）× 4 行 = 8
+    assert shared[0, 1] == 8
+
+
+def test_ensure_connected_repairs_disconnected_fragment() -> None:
+    """§1.4 关键约束：碎片必须重分配给相邻板块，保证每个板块连通。"""
+    plate = np.zeros((9, 9), dtype=np.int32)
+    plate[3:6, 3:6] = 1  # 板块 1 是板块 0 内部的一块飞地
+    fixed = voronoi.ensure_connected(plate)
+    assert len(np.unique(fixed)) == 2  # 板块数不因修复而丢失
+    for lab in np.unique(fixed):
+        _, n = voronoi.connected_components(fixed == lab)
+        assert n == 1, f"板块 {lab} 仍有 {n} 个连通分量"
+
+
+def test_ensure_connected_keeps_largest_component() -> None:
+    """修复保留每个板块的最大连通分量。"""
+    plate = np.zeros((10, 10), dtype=np.int32)
+    plate[0:3, 0:3] = 1  # 板块 1 的主体
+    plate[7:8, 7:8] = 1  # 板块 1 的孤立碎片
+    fixed = voronoi.ensure_connected(plate)
+    assert fixed[0, 0] == 1 and fixed[2, 2] == 1
+    assert fixed[7, 7] == 0  # 碎片并入相邻的板块 0
+
+
+def test_connected_components_basic() -> None:
+    mask = np.zeros((5, 5), dtype=bool)
+    mask[1:3, 1:3] = True
+    mask[4, 4] = True
+    labels, n = voronoi.connected_components(mask)
+    assert n == 2
+    assert labels[1, 1] == 1
+    assert labels[4, 4] == 2

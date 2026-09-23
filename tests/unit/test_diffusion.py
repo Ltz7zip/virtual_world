@@ -20,7 +20,11 @@ def _sphere_coords(nlat: int, nlon: int, scale: float = 4.0) -> tuple[np.ndarray
     lon = -180.0 + (360.0 / nlon) * (np.arange(nlon) + 0.5)
     phi, lam = np.deg2rad(lat)[:, None], np.deg2rad(lon)[None, :]
     cp = np.cos(phi)
-    return cp * np.cos(lam) * scale, cp * np.sin(lam) * scale, np.sin(phi) * np.ones((nlat, nlon)) * scale
+    return (
+        cp * np.cos(lam) * scale,
+        cp * np.sin(lam) * scale,
+        np.sin(phi) * np.ones((nlat, nlon)) * scale,
+    )
 
 
 def _tectonic(nlat: int, nlon: int, seed: int = 7, amp: float = 2500.0) -> np.ndarray:
@@ -268,7 +272,9 @@ def test_structured_refiner_seamless_across_overlapping_tiles() -> None:
     refiner = df.StructuredDiffusionRefiner()
     xyz = _sphere_coords(nlat, nlon, scale=6.0)
     tiles = df.iter_tiles(nlat, nlon, tile_size=16, overlap=8)
-    pieces = [refiner.refine_tile(df.TileConditions.from_global(t, tec, cond, xyz), seed=9) for t in tiles]
+    pieces = [
+        refiner.refine_tile(df.TileConditions.from_global(t, tec, cond, xyz), seed=9) for t in tiles
+    ]
     left, right = pieces[0], pieces[1]
     left_cols = tiles[0].j1 - tiles[1].j0
     assert left_cols > 0
@@ -280,7 +286,9 @@ def test_structured_refiner_seamless_across_overlapping_tiles() -> None:
 
 def test_model_refiner_reports_missing_dependency() -> None:
     """无可用的扩散模型时给出可操作的错误，而非静默降级。"""
-    refiner = df.TerrainDiffusionRefiner(model_id="xandergos/terrain-diffusion-90m", allow_download=False)
+    refiner = df.TerrainDiffusionRefiner(
+        model_id="xandergos/terrain-diffusion-90m", allow_download=False
+    )
     nlat, nlon = 8, 16
     tec = _tectonic(nlat, nlon, seed=1)
     cond = df.build_condition_channels(tec, _boundary_types(nlat, nlon), block=4)
@@ -364,7 +372,9 @@ def test_frequency_merge_windows_validated() -> None:
 def test_refine_diffusion_result_shape_and_identity() -> None:
     nlat, nlon = 24, 48
     tec = _tectonic(nlat, nlon)
-    res = df.refine_diffusion(tec, _boundary_types(nlat, nlon), seed=3, tile_size=16, overlap=4, block=4)
+    res = df.refine_diffusion(
+        tec, _boundary_types(nlat, nlon), seed=3, tile_size=16, overlap=4, block=4
+    )
     assert res.elevation.shape == (nlat, nlon)
     assert res.residual.shape == (nlat, nlon)
     assert np.allclose(res.tectonic, tec)
@@ -391,7 +401,13 @@ def test_refine_diffusion_accepts_external_refiner() -> None:
 
     tec = _tectonic(nlat, nlon)
     res = df.refine_diffusion(
-        tec, _boundary_types(nlat, nlon), seed=1, tile_size=16, overlap=0, block=4, refiner=HalfRefiner()
+        tec,
+        _boundary_types(nlat, nlon),
+        seed=1,
+        tile_size=16,
+        overlap=0,
+        block=4,
+        refiner=HalfRefiner(),
     )
     assert res.elevation.shape == (nlat, nlon)
     # 常数 0.5 残差经约束后被清零（零均值 + 低频截断）
@@ -402,7 +418,9 @@ def test_refine_diffusion_constraint_report_clean() -> None:
     """顶层管线自身输出应通过全部约束验证（§6 第 7 步）。"""
     nlat, nlon = 32, 64
     tec = _tectonic(nlat, nlon)
-    res = df.refine_diffusion(tec, _boundary_types(nlat, nlon), seed=23, tile_size=16, overlap=4, block=8)
+    res = df.refine_diffusion(
+        tec, _boundary_types(nlat, nlon), seed=23, tile_size=16, overlap=4, block=8
+    )
     problems = df.validate_constraints(res, block=8, coastline_eps=1.0)
     assert problems == []
 
@@ -478,3 +496,120 @@ def test_condition_cache_key_reacts_to_input() -> None:
     assert k1 != k2
     assert k1 != k3
     assert k1 == df.condition_cache_key(tec, bt, block=4)
+
+
+# ===== 行为 10：§1.3 选核图（两条路径纹理一致） =====
+
+
+def test_condition_channels_include_kernel_map() -> None:
+    """条件通道携带 §1.3 选核图；模型输入仍是 §3.2 的四通道。"""
+    nlat, nlon = 24, 48
+    tec = _tectonic(nlat, nlon)
+    bt = _boundary_types(nlat, nlon)
+    cond = df.build_condition_channels(tec, bt, block=4)
+    assert np.array_equal(cond.kernel_map, nr.select_noise_kernel(bt, tec))
+    assert cond.kernel_map.shape == (nlat, nlon)
+    assert cond.stack().shape == (4, nlat, nlon)
+
+
+def test_tile_conditions_carry_kernel_map_and_init_noise() -> None:
+    nlat, nlon = 16, 32
+    tec = _tectonic(nlat, nlon)
+    cond = df.build_condition_channels(tec, _boundary_types(nlat, nlon), block=4)
+    coords = _sphere_coords(nlat, nlon, scale=6.0)
+    noise = np.full((nlat, nlon), 123.0)
+    tile = df.Tile(4, 12, 8, 24)
+
+    plain = df.TileConditions.from_global(tile, tec, cond, coords)
+    assert np.all(plain.init_noise == 0.0)
+    assert np.array_equal(plain.kernel_map, cond.kernel_map[4:12, 8:24])
+    assert np.array_equal(plain.kernel_map, nr.select_noise_kernel(
+        _boundary_types(nlat, nlon), tec
+    )[4:12, 8:24])
+
+    with_noise = df.TileConditions.from_global(tile, tec, cond, coords, noise)
+    assert np.all(with_noise.init_noise == 123.0)
+    assert with_noise.tectonic.shape == (8, 16)
+
+
+def test_structured_refiner_uses_kernel_map() -> None:
+    """精修器按 §1.3 选核图逐单元选核——换核图即换纹理。"""
+    import dataclasses
+
+    nlat, nlon = 16, 32
+    tec = _tectonic(nlat, nlon)
+    cond = df.build_condition_channels(tec, _boundary_types(nlat, nlon), block=4)
+    xyz = _sphere_coords(nlat, nlon, scale=6.0)
+    tcond = df.TileConditions.from_global(df.Tile(0, nlat, 0, nlon), tec, cond, xyz)
+    refiner = df.StructuredDiffusionRefiner()
+
+    simplex_only = dataclasses.replace(
+        tcond, kernel_map=np.full((nlat, nlon), int(nr.Kernel.SIMPLEX), dtype=np.int32)
+    )
+    worley_only = dataclasses.replace(
+        tcond, kernel_map=np.full((nlat, nlon), int(nr.Kernel.WORLEY), dtype=np.int32)
+    )
+    a = refiner.refine_tile(simplex_only, seed=5)
+    b = refiner.refine_tile(worley_only, seed=5)
+    assert not np.allclose(a, b)
+    # 与默认选核图（含造山带 Ridged / 洋中脊 Worley）也不同
+    assert not np.allclose(a, refiner.refine_tile(tcond, seed=5))
+
+
+def test_structured_refiner_uses_initial_noise() -> None:
+    """§5.2 第 2 步：有初始噪声时以其为细节基底，且重叠 tile 仍逐点一致。"""
+    nlat, nlon = 24, 48
+    tec = _tectonic(nlat, nlon)
+    cond = df.build_condition_channels(tec, _boundary_types(nlat, nlon), block=4)
+    xyz = _sphere_coords(nlat, nlon, scale=6.0)
+    noise = nr.simplex_noise(*_sphere_coords(nlat, nlon, scale=20.0), seed=77) * 400.0
+
+    tile = df.Tile(0, nlat, 0, nlon)
+    base = df.TileConditions.from_global(tile, tec, cond, xyz)
+    seeded = df.TileConditions.from_global(tile, tec, cond, xyz, noise)
+    refiner = df.StructuredDiffusionRefiner()
+    out = refiner.refine_tile(seeded, seed=5)
+    corr = float(np.corrcoef(out.ravel(), noise.ravel())[0, 1])
+    assert corr > 0.9
+    assert not np.allclose(out, refiner.refine_tile(base, seed=5))
+
+    # 重叠区一致性：初始噪声逐点切片 + 逐点增益，不应产生接缝
+    tiles = df.iter_tiles(nlat, nlon, tile_size=16, overlap=8)
+    pieces = [
+        refiner.refine_tile(df.TileConditions.from_global(t, tec, cond, xyz, noise), seed=9)
+        for t in tiles
+    ]
+    overlap_cols = tiles[0].j1 - tiles[1].j0
+    assert overlap_cols > 0
+    assert np.allclose(pieces[0][:, -overlap_cols:], pieces[1][:, :overlap_cols])
+
+
+def test_refine_diffusion_uses_noise_as_initial_noise() -> None:
+    """顶层管线把 noise 同时作为中频带与扩散初始噪声（§5.1、§5.2）。"""
+    nlat, nlon = 24, 48
+    tec = _tectonic(nlat, nlon)
+    noise = nr.simplex_noise(*_sphere_coords(nlat, nlon, scale=20.0), seed=13) * 500.0
+    res = df.refine_diffusion(
+        tec, _boundary_types(nlat, nlon), seed=5, noise=noise, tile_size=16, overlap=4, block=4
+    )
+    assert float(np.corrcoef(res.residual.ravel(), noise.ravel())[0, 1]) > 0.5
+
+
+def test_refine_diffusion_rejects_non_2d_grid() -> None:
+    """tile + FFT 融合建立在矩形周期网格上，立方球需走噪声路径或先重网格。"""
+    tec = np.zeros((6, 8, 8))
+    bt = np.zeros((6, 8, 8), dtype=np.int32)
+    with pytest.raises(ValueError, match="经纬网格"):
+        df.refine_diffusion(tec, bt, seed=0)
+
+
+def test_condition_cache_preserves_kernel_map(tmp_path) -> None:
+    nlat, nlon = 16, 32
+    tec = _tectonic(nlat, nlon)
+    bt = _boundary_types(nlat, nlon)
+    cache = df.ConditionsCache(tmp_path)
+    key = df.condition_cache_key(tec, bt, block=4)
+    first = cache.get_or_build(key, lambda: df.build_condition_channels(tec, bt, block=4))
+    second = df.ConditionsCache(tmp_path).get_or_build(key, lambda: df.build_condition_channels(tec, bt, block=4))
+    assert np.array_equal(first.kernel_map, second.kernel_map)
+    assert np.array_equal(second.kernel_map, nr.select_noise_kernel(bt, tec))

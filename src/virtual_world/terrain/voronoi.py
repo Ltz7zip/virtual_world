@@ -1,17 +1,80 @@
 """球面域扭曲 Voronoi 板块划分（《第一层完善》§1）。
 
-流程：Fibonacci 球面种子点 → 域扭曲 → 球面最近邻归属 → 微板块归并。
+流程：Fibonacci 球面种子点 → 域扭曲 → 球面最近邻归属 → 微板块归并 → 连通性修复。
 坐标约定：单元坐标经 :func:`virtual_world.core.spherical.latlon_to_xyz`
 转为单位向量参与球面计算，结果保持 ``(nlat, nlon)`` 字段形状。
+
+邻接约定（与 :mod:`virtual_world.core.spherical` 一致）：**经度循环、纬度非循环**
+（极点约束），因此南北极行之间不产生伪邻接。
+
+**网格无关性**（方案《地形生成混合方案》§1.5）：邻接相关的函数都接受可选的
+``neighbours`` 参数（形状 ``(4, N)`` 的扁平邻接索引，顺序见
+:func:`latlon_neighbours`）。默认 ``None`` 时按经纬网格构造，因此既有调用不受影响；
+立方球网格传入 :meth:`virtual_world.core.cubed_sphere.CubedSphere.neighbors` 即可。
 """
 
 from __future__ import annotations
 
+import heapq
+from collections import deque
+
 import numpy as np
+from scipy import sparse  # type: ignore[import-untyped]
+from scipy.sparse import csgraph  # type: ignore[import-untyped]
+
+from ..core.cubed_sphere import CubedSphere
 
 #: 大板块数量范围（方案 §1.2.4：6–12）
 MAJOR_PLATE_MIN = 6
 MAJOR_PLATE_MAX = 12
+
+
+def latlon_neighbours(nlat: int, nlon: int) -> np.ndarray:
+    """经纬网格 4-邻接扁平索引 ``(4, nlat*nlon)``，``-1`` 表示域外（无邻居）。
+
+    顺序与 :data:`virtual_world.core.cubed_sphere.DIRECTIONS` 一致：
+    **北(i+1)、南(i-1)、东(j+1)、西(j-1)**。经度循环、纬度非循环（极点约束）。
+    """
+    nlat, nlon = int(nlat), int(nlon)
+    if nlat <= 0 or nlon <= 0:
+        raise ValueError("nlat 与 nlon 必须为正")
+    idx = np.arange(nlat * nlon, dtype=np.int64).reshape(nlat, nlon)
+    north = np.full((nlat, nlon), -1, dtype=np.int64)
+    north[:-1, :] = idx[1:, :]
+    south = np.full((nlat, nlon), -1, dtype=np.int64)
+    south[1:, :] = idx[:-1, :]
+    cols = np.arange(nlon)
+    east = idx[:, (cols + 1) % nlon]
+    west = idx[:, (cols - 1) % nlon]
+    return np.ascontiguousarray(np.stack([north, south, east, west], axis=0).reshape(4, nlat * nlon))
+
+
+def grid_neighbours(shape: tuple[int, ...], neighbours: np.ndarray | None = None) -> np.ndarray:
+    """按网格形状给出 4-邻接扁平索引 ``(4, N)``，``-1`` 表示域外（无邻居）。
+
+    - 显式给出 ``neighbours`` 时校验后原样返回；
+    - 2D 形状按经纬网格（:func:`latlon_neighbours`：经度循环、纬度非循环）；
+    - 3D ``(6, n, n)`` 按立方球网格（:class:`~virtual_world.core.cubed_sphere.CubedSphere`，
+      每格都有 4 个邻居、无域外单元）。
+    """
+    expected = int(np.prod(shape))
+    if neighbours is not None:
+        nbr = np.asarray(neighbours, dtype=np.int64)
+        if nbr.ndim != 2 or nbr.shape[0] != 4 or nbr.shape[1] != expected:
+            raise ValueError(f"neighbours 形状应为 (4, {expected})，实际 {nbr.shape}")
+        return nbr
+    if len(shape) == 2:
+        return latlon_neighbours(shape[0], shape[1])
+    if len(shape) == 3 and shape[0] == 6 and shape[1] == shape[2]:
+        return CubedSphere(shape[1]).neighbors()
+    raise ValueError(f"无法推断该形状的邻接，请显式给出 neighbours（shape={shape}）")
+
+
+def plate_angular_radius(n_seeds: int) -> float:
+    """板块平均角半径 (rad)：由球面均分面积 ``4π/N`` 反解球冠角半径（§1.2）。"""
+    if n_seeds <= 0:
+        raise ValueError(f"种子点数量必须为正整数，实际为 {n_seeds}")
+    return float(np.arccos(np.clip(1.0 - 2.0 / n_seeds, -1.0, 1.0)))
 
 
 def fibonacci_sphere(n: int) -> np.ndarray:
@@ -168,21 +231,223 @@ def assign_plates(
     return np.asarray(nearest.argmax(axis=0).astype(np.int32).reshape(lat_2d.shape))
 
 
+# ===== 邻接与连通性（经度循环、纬度非循环）=====
+
+
+def connected_components(mask: np.ndarray, neighbours: np.ndarray | None = None) -> tuple[np.ndarray, int]:
+    """4-邻连通分量标记：返回 ``(标签场, 分量数)``，0 为背景。
+
+    标签按**光栅序**（首个单元出现的先后）从 1 开始编号，与 ``scipy.ndimage.label``
+    的语义一致。经度方向循环、纬度方向非循环由 ``neighbours`` 决定（见
+    :func:`latlon_neighbours` 与 :func:`grid_neighbours`）。
+    """
+    values = np.asarray(mask, dtype=bool)
+    nbr = grid_neighbours(values.shape, neighbours)
+    flat = values.ravel()
+    n = flat.size
+    if not flat.any():
+        return np.zeros(values.shape, dtype=np.int32), 0
+
+    source = np.arange(n, dtype=np.int64)
+    rows: list[np.ndarray] = []
+    cols: list[np.ndarray] = []
+    for d in range(4):
+        nb = nbr[d]
+        valid_nb = nb >= 0
+        valid = valid_nb & flat & flat[np.where(valid_nb, nb, 0)]
+        rows.append(source[valid])
+        cols.append(nb[valid])
+    rows_a = np.concatenate(rows)
+    cols_a = np.concatenate(cols)
+    graph = sparse.coo_matrix(
+        (np.ones(rows_a.size, dtype=np.int8), (rows_a, cols_a)), shape=(n, n)
+    ).tocsr()
+    _, raw = csgraph.connected_components(graph, directed=False)
+    raw = np.asarray(raw, dtype=np.int64)
+
+    mask_idx = np.nonzero(flat)[0]
+    comp = raw[mask_idx]
+    uniq, inverse = np.unique(comp, return_inverse=True)
+    first = np.full(uniq.size, mask_idx.size, dtype=np.int64)
+    np.minimum.at(first, inverse, np.arange(comp.size, dtype=np.int64))
+    rank = np.argsort(first, kind="stable")
+    remap = np.empty(uniq.size, dtype=np.int32)
+    remap[rank] = np.arange(1, uniq.size + 1, dtype=np.int32)
+
+    out = np.zeros(n, dtype=np.int32)
+    out[mask_idx] = remap[inverse]
+    return out.reshape(values.shape), int(uniq.size)
+
+
+def micro_plate_adjacency(
+    field: np.ndarray, neighbours: np.ndarray | None = None
+) -> np.ndarray:
+    """微板块邻接矩阵：``shared[a, b]`` = 两板块共享的网格边数（对称、对角为 0）。
+
+    邻接由 ``neighbours`` 给出（缺省为经纬网格：经度循环、**纬度非循环**，
+    南北极行之间不产生伪邻接）。每条无向边只计一次（以扁平索引较小者为起点去重）。
+    """
+    values = np.asarray(field)
+    nbr = grid_neighbours(values.shape, neighbours)
+    flat = values.ravel()
+    n_ids = int(flat.max()) + 1
+    shared = np.zeros((n_ids, n_ids), dtype=np.int64)
+    source = np.arange(flat.size, dtype=np.int64)
+    for d in range(4):
+        nb = nbr[d]
+        valid = nb >= 0
+        src = source[valid]
+        dst = nb[valid]
+        keep = src < dst
+        np.add.at(shared, (flat[src[keep]], flat[dst[keep]]), 1)
+    shared = shared + shared.T
+    np.fill_diagonal(shared, 0)
+    return shared
+
+
+def _neighbour_label_counts(
+    labels: np.ndarray, mask: np.ndarray, neighbours: np.ndarray | None = None
+) -> dict[int, int]:
+    """统计 ``mask`` 区域四周的标签出现次数（含跨面接缝，域外不计）。"""
+    values = np.asarray(labels)
+    nbr = grid_neighbours(values.shape, neighbours)
+    flat_labels = values.ravel()
+    fragment = np.asarray(mask, dtype=bool).ravel()
+
+    counts: dict[int, int] = {}
+    for d in range(4):
+        nb = nbr[d]
+        valid = (nb >= 0) & fragment
+        if not valid.any():
+            continue
+        neighbour_labels = flat_labels[np.where(valid, nb, 0)][valid]
+        uniq, freq = np.unique(neighbour_labels, return_counts=True)
+        for value, count in zip(uniq.tolist(), freq.tolist(), strict=True):
+            counts[int(value)] = counts.get(int(value), 0) + int(count)
+    return counts
+
+
+def ensure_connected(
+    plate_map: np.ndarray, max_iter: int = 8, neighbours: np.ndarray | None = None
+) -> np.ndarray:
+    """保证每个板块在球面上连通（§1.4 关键约束）。
+
+    每个板块保留其最大连通分量，其余碎片整体并入相邻板块中共享边界最长者。
+    由于每个板块至少保留一个分量，板块数不会因修复而减少。
+    """
+    out = np.array(plate_map, dtype=np.int32, copy=True)
+    nbr = grid_neighbours(out.shape, neighbours)
+    for _ in range(max_iter):
+        changed = False
+        for lab in np.unique(out):
+            labels, _ = connected_components(out == lab, nbr)
+            sizes = np.bincount(labels.ravel())
+            sizes[0] = 0
+            comp_ids = np.nonzero(sizes)[0]
+            if comp_ids.size <= 1:
+                continue
+            keep = int(comp_ids[int(np.argmax(sizes[comp_ids]))])
+            for comp_id in comp_ids:
+                if comp_id == keep:
+                    continue
+                fragment = labels == comp_id
+                counts = _neighbour_label_counts(out, fragment, nbr)
+                counts.pop(int(lab), None)
+                if not counts:
+                    continue
+                out[fragment] = max(counts, key=counts.__getitem__)
+                changed = True
+        if not changed:
+            break
+    return out
+
+
+def _graph_distance(shared: np.ndarray, sources: list[int]) -> np.ndarray:
+    """微板块邻接图上的 BFS 跳数距离；不可达节点记为 ``n_ids``（视作最远）。"""
+    n_ids = shared.shape[0]
+    dist = np.full(n_ids, np.inf)
+    queue: deque[int] = deque()
+    for source in sources:
+        dist[source] = 0.0
+        queue.append(int(source))
+    while queue:
+        node = queue.popleft()
+        for nb in np.nonzero(shared[node] > 0)[0]:
+            if np.isinf(dist[nb]):
+                dist[nb] = dist[node] + 1.0
+                queue.append(int(nb))
+    return np.where(np.isinf(dist), float(n_ids), dist)
+
+
+def _select_cores(shared: np.ndarray, n_major: int, seed: int) -> list[int]:
+    """选 ``n_major`` 个核心微板块：最远点初始化（首核由 ``seed`` 决定）。
+
+    每轮取到已有核心**图上跳数距离**最大的微板块作为新核心，使核心在全球均匀
+    铺开——这是各板块面积均衡的前提（仅按共享边界长度选会令核心聚簇）。
+    """
+    rng = np.random.default_rng(seed)
+    cores = [int(rng.integers(shared.shape[0]))]
+    distance = _graph_distance(shared, cores)
+    while len(cores) < n_major:
+        next_core = int(np.argmax(distance))
+        cores.append(next_core)
+        distance = np.minimum(distance, _graph_distance(shared, [next_core]))
+    return cores
+
+
+def _grow_regions(shared: np.ndarray, cores: list[int], n_major: int) -> np.ndarray:
+    """在微板块邻接图上按多源 Dijkstra（单位边长）生长出 ``n_major`` 个区域。
+
+    代价函数取方案 §1.4 的 ``cost = α·dist + β/shared_length``：主导项为到核心的
+    图距离 α·dist（保证各板块面积均衡、紧凑），等距时优先共享边界更长者
+    （β 项，使边界更平滑）。按拓扑顺序认领节点，因此每个区域天然连通。
+    """
+    owner = np.full(shared.shape[0], -1, dtype=np.int32)
+    heap: list[tuple[int, int, int, int]] = []
+    for k, core in enumerate(cores):
+        owner[core] = k
+        heapq.heappush(heap, (0, 0, core, k))
+
+    while heap:
+        dist, neg_shared, node, k = heapq.heappop(heap)
+        if owner[node] >= 0 and owner[node] != k:
+            continue
+        owner[node] = k
+        for nb in np.nonzero(shared[node] > 0)[0]:
+            nb = int(nb)
+            if owner[nb] >= 0:
+                continue
+            heapq.heappush(heap, (dist + 1, -int(shared[nb, cores[k]]), nb, k))
+
+    # 兜底：邻接图存在孤立分量时并入 0 号核心
+    owner[owner < 0] = 0
+    return owner
+
+
 # ===== 微板块归并 =====
 
 
-def merge_micro_plates(micro_plate: np.ndarray, n_major: int, seed: int = 0) -> np.ndarray:
+def merge_micro_plates(
+    micro_plate: np.ndarray,
+    n_major: int,
+    seed: int = 0,
+    neighbours: np.ndarray | None = None,
+) -> np.ndarray:
     """把微板块归并为 ``n_major`` 个大板块，返回重编号为 0..n_major-1 的标签场。
 
     方案 §1.4 归并策略：
-    1. 用 k-means++ 风格（与已选核心共享边界最少）确定性选出 ``n_major`` 个核心微板块；
-    2. 多源区域生长：从未分配微板块中，重复将"与任一已分配板块共享边界最长"的
-       板块并入对应核心，直到全部归并完毕——天然保证大板块在球面上连续。
+    1. :func:`_select_cores` 确定 ``n_major`` 个核心微板块（首核由 ``seed`` 决定，
+       其余最大化空间分散）；
+    2. :func:`_grow_regions` 按代价 ``cost = α·dist + β/shared_length`` 做多源区域
+       生长，使各板块面积均衡且边界平滑；
+    3. :func:`ensure_connected` 校验并修复碎片，保证大板块在球面上连通。
 
-    微板块邻接按 4-邻计算（经度为循环边界）。
+    微板块邻接由 ``neighbours`` 给出（缺省为经纬网格：经度循环、纬度非循环）。
     """
-    if n_major < 1:
-        raise ValueError(f"n_major 必须 >= 1，实际为 {n_major}")
+    if not MAJOR_PLATE_MIN <= n_major <= MAJOR_PLATE_MAX:
+        raise ValueError(
+            f"n_major 应在 {MAJOR_PLATE_MIN}–{MAJOR_PLATE_MAX} 之间（方案 §1.2.4），实际为 {n_major}"
+        )
 
     unique_result = np.unique(micro_plate, return_inverse=True)
     dense: np.ndarray = unique_result[1]
@@ -193,59 +458,10 @@ def merge_micro_plates(micro_plate: np.ndarray, n_major: int, seed: int = 0) -> 
         raise ValueError(f"n_major={n_major} 超过微板块数 {n_ids}")
 
     if n_major == n_ids:
-        return dense.reshape(micro_plate.shape).astype(np.int32)
+        return np.asarray(dense.reshape(micro_plate.shape).astype(np.int32))
 
     field = np.asarray(dense.reshape(micro_plate.shape))
-    nlat, nlon = field.shape
-
-    # 邻接矩阵：shared[a, b] = a、b 板块之间共享的网格边界数（对称）
-    shared = np.zeros((n_ids, n_ids), dtype=np.int64)
-    east = np.roll(field, -1, axis=1)
-    south = np.roll(field, 1, axis=0)
-    np.add.at(shared, (field.ravel(), east.ravel()), 1)
-    np.add.at(shared, (field.ravel(), south.ravel()), 1)
-    shared = shared + shared.T
-    np.fill_diagonal(shared, 0)
-
-    rng = np.random.default_rng(seed)
-    remaining = set(range(n_ids))
-    cores: list[int] = []
-    if n_major >= 1:
-        first = int(rng.integers(n_ids))
-        cores.append(first)
-        remaining.discard(first)
-    while len(cores) < n_major and remaining:
-        # 选与已选核心共享边界总和最小的板块作为新核心（最大化分散）
-        next_core = min(remaining, key=lambda p: int(shared[p, cores].sum()))
-        cores.append(next_core)
-        remaining.discard(next_core)
-    if len(cores) < n_major:
-        raise ValueError(f"无法选出 {n_major} 个不重叠核心微板块")
-
-    assign = np.full(n_ids, -1, dtype=np.int32)
-    for k, c in enumerate(cores):
-        assign[c] = k
-
-    pending = list(remaining)
-    while pending:
-        newly = []
-        for p in pending:
-            nbrs = np.nonzero(shared[p] > 0)[0]
-            assigned = nbrs[assign[nbrs] >= 0]
-            core_len = np.zeros(n_major, dtype=np.int64)
-            if assigned.size:
-                np.add.at(core_len, assign[assigned], shared[p][assigned])
-            best = int(core_len.argmax())
-            if core_len[best] > 0:
-                assign[p] = best
-            else:
-                newly.append(p)
-        if len(newly) == len(pending):
-            # 极端断开图：直接分配给离它最近的核心（按共享长度，全 0 则 0）
-            for p in pending:
-                if assign[p] < 0:
-                    assign[p] = 0
-            break
-        pending = newly
-
-    return np.asarray(assign[field].astype(np.int32))
+    shared = micro_plate_adjacency(field, neighbours)
+    cores = _select_cores(shared, n_major, seed)
+    owner = _grow_regions(shared, cores, n_major)
+    return ensure_connected(np.asarray(owner[field].astype(np.int32)), neighbours=neighbours)

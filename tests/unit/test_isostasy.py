@@ -107,3 +107,106 @@ def test_integrate_crust_validation() -> None:
         isostasy.integrate_crust_thickness(
             np.zeros((4, 6)), 0.0, 0.0, np.zeros((4, 6)), kappa=0.0, dt=-1.0, n_steps=1
         )
+
+
+# ===== §4.2 质量守恒与缩短因子 =====
+
+
+def test_shortening_factor_round_trip() -> None:
+    """beta = C/C_0 与 C = C_0*beta 互逆（§4.2）。"""
+    c0, beta = 36.0, 2.34
+    crust = isostasy.crust_from_shortening(c0, beta)
+    assert crust == pytest.approx(c0 * beta)
+    assert isostasy.shortening_factor(crust, c0) == pytest.approx(beta)
+
+
+def test_shortening_factor_andes_reference() -> None:
+    """§4.2 基准：安第斯中部 beta_0 = 2.34 对应 C = 30*2.34 km。"""
+    c0 = 30.0
+    beta = 2.34
+    crust = isostasy.crust_from_shortening(c0, beta)
+    assert crust == pytest.approx(70.2)
+    assert isostasy.shortening_factor(crust, c0) == pytest.approx(beta)
+
+
+def test_mass_conservation_identity() -> None:
+    """L_0*C_0 = L*C：缩短量与增厚量严格互换（§4.2）。"""
+    c0, l0, convergence = 36.0, 8000.0, 4000.0
+    crust, beta = isostasy.mass_conserving_thickness(c0, l0, convergence)
+    remaining = l0 - isostasy.shortening_distance_km(beta, l0)
+    assert remaining == pytest.approx(l0 - convergence)
+    assert remaining * crust == pytest.approx(l0 * c0, rel=1e-12)
+
+
+def test_max_shortening_factor_limits() -> None:
+    """无汇聚 -> beta=1；缩短一半 -> beta=2（§4.2）。"""
+    assert isostasy.max_shortening_factor(1000.0, 0.0) == pytest.approx(1.0)
+    assert isostasy.max_shortening_factor(1000.0, 500.0) == pytest.approx(2.0)
+
+
+def test_shortening_validation() -> None:
+    with pytest.raises(ValueError):
+        isostasy.shortening_factor(30.0, 36.0)  # 增厚后反而更薄
+    with pytest.raises(ValueError):
+        isostasy.shortening_factor(36.0, 0.0)
+    with pytest.raises(ValueError):
+        isostasy.crust_from_shortening(36.0, 0.5)
+    with pytest.raises(ValueError):
+        isostasy.max_shortening_factor(1000.0, 1000.0)
+    with pytest.raises(ValueError):
+        isostasy.max_shortening_factor(1000.0, -1.0)
+    with pytest.raises(ValueError):
+        isostasy.shortening_distance_km(0.8, 1000.0)
+
+
+# ===== §4.3 造山带高宽比 =====
+
+
+def test_orogen_aspect_ratio_scaling() -> None:
+    """§4.3：H/W ∝ (d_rho*g*C_0)/(eta_eff*|v_rel|)。"""
+    base = isostasy.orogen_aspect_ratio(500.0, 36.0, 1.0)
+    # 地壳越厚 -> 高宽比越大
+    assert isostasy.orogen_aspect_ratio(500.0, 72.0, 1.0) > base
+    # 汇聚越快 -> 按显式公式高宽比越小（见函数 docstring 的方案自相矛盾说明）
+    assert isostasy.orogen_aspect_ratio(500.0, 36.0, 2.0) < base
+    # 密度差越大 -> 高宽比越大
+    assert isostasy.orogen_aspect_ratio(1000.0, 36.0, 1.0) > base
+    # 增厚效率越高 -> 高宽比越小
+    assert isostasy.orogen_aspect_ratio(500.0, 36.0, 1.0, eta_eff=0.4) < base
+
+
+def test_orogen_aspect_ratio_is_calibrated() -> None:
+    """参考条件下高宽比等于标定值，且随 C_0 线性变化（§4.3）。"""
+    ref = isostasy.orogen_aspect_ratio(
+        isostasy.REFERENCE_DELTA_RHO, isostasy.REFERENCE_C0_KM, isostasy.REFERENCE_V_REL
+    )
+    assert ref == pytest.approx(isostasy.REFERENCE_ASPECT_RATIO)
+    doubled = isostasy.orogen_aspect_ratio(
+        isostasy.REFERENCE_DELTA_RHO, 2.0 * isostasy.REFERENCE_C0_KM, isostasy.REFERENCE_V_REL
+    )
+    assert doubled == pytest.approx(2.0 * isostasy.REFERENCE_ASPECT_RATIO)
+    # 参考高宽比 + 喜马拉雅量级高度 → 半宽 100 km 量级
+    assert isostasy.ridge_half_width_km(5000.0, isostasy.REFERENCE_ASPECT_RATIO) == pytest.approx(
+        100.0
+    )
+    # 归一化后正是方案的比例式：比值之比等于物理量之比
+    ratio_a = isostasy.orogen_aspect_ratio(500.0, 36.0, 1.0)
+    ratio_b = isostasy.orogen_aspect_ratio(500.0, 36.0, 3.0)
+    assert ratio_a / ratio_b == pytest.approx(3.0)
+
+
+def test_ridge_half_width_from_aspect_ratio() -> None:
+    """W = H/(H/W)（§4.3）。"""
+    assert isostasy.ridge_half_width_km(2000.0, 0.1) == pytest.approx(20.0)
+    assert isostasy.ridge_half_width_km(-2000.0, 0.1) == pytest.approx(20.0)
+
+
+def test_orogen_aspect_ratio_validation() -> None:
+    with pytest.raises(ValueError):
+        isostasy.orogen_aspect_ratio(500.0, 0.0, 1.0)
+    with pytest.raises(ValueError):
+        isostasy.orogen_aspect_ratio(500.0, 36.0, 0.0)
+    with pytest.raises(ValueError):
+        isostasy.orogen_aspect_ratio(500.0, 36.0, 1.0, eta_eff=0.0)
+    with pytest.raises(ValueError):
+        isostasy.ridge_half_width_km(1000.0, 0.0)
