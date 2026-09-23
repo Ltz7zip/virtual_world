@@ -47,6 +47,9 @@ from . import (
     voronoi,
 )
 from .diffusion import (
+    HF_MIRROR_ENDPOINT,
+    HF_MIRROR_HINT,
+    TERRAIN_DIFFUSION_LAYOUT_HINT,
     ConditionChannels,
     ConditionsCache,
     DiffusionLevel,
@@ -222,6 +225,8 @@ __all__ = [
     "DiffusionRefiner",
     "ErosionResult",
     "HierarchicalRefineResult",
+    "HF_MIRROR_ENDPOINT",
+    "HF_MIRROR_HINT",
     "HydraulicErosionResult",
     "HydrologyResult",
     "HYDRAULIC_BACKENDS",
@@ -239,6 +244,7 @@ __all__ = [
     "TRENCH_DEPTH_MIN",
     "TectonicFieldResult",
     "TerrainDiffusionRefiner",
+    "TERRAIN_DIFFUSION_LAYOUT_HINT",
     "TerrainStage",
     "ThermalErosionResult",
     "TileConditions",

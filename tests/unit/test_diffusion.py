@@ -546,9 +546,9 @@ def test_tile_conditions_carry_kernel_map_and_init_noise() -> None:
     plain = df.TileConditions.from_global(tile, tec, cond, coords)
     assert np.all(plain.init_noise == 0.0)
     assert np.array_equal(plain.kernel_map, cond.kernel_map[4:12, 8:24])
-    assert np.array_equal(plain.kernel_map, nr.select_noise_kernel(
-        _boundary_types(nlat, nlon), tec
-    )[4:12, 8:24])
+    assert np.array_equal(
+        plain.kernel_map, nr.select_noise_kernel(_boundary_types(nlat, nlon), tec)[4:12, 8:24]
+    )
 
     with_noise = df.TileConditions.from_global(tile, tec, cond, coords, noise)
     assert np.all(with_noise.init_noise == 123.0)
@@ -633,7 +633,9 @@ def test_condition_cache_preserves_kernel_map(tmp_path) -> None:
     cache = df.ConditionsCache(tmp_path)
     key = df.condition_cache_key(tec, bt, block=4)
     first = cache.get_or_build(key, lambda: df.build_condition_channels(tec, bt, block=4))
-    second = df.ConditionsCache(tmp_path).get_or_build(key, lambda: df.build_condition_channels(tec, bt, block=4))
+    second = df.ConditionsCache(tmp_path).get_or_build(
+        key, lambda: df.build_condition_channels(tec, bt, block=4)
+    )
     assert np.array_equal(first.kernel_map, second.kernel_map)
     assert np.array_equal(second.kernel_map, nr.select_noise_kernel(bt, tec))
 
@@ -657,8 +659,12 @@ class _RecordingRefiner:
 
 def _levels(tile_size: int = 32, overlap: int = 0) -> list[df.DiffusionLevel]:
     return [
-        df.DiffusionLevel(freq_scale=8.0, residual_fraction=0.06, tile_size=tile_size, overlap=overlap),
-        df.DiffusionLevel(freq_scale=18.0, residual_fraction=0.03, tile_size=tile_size, overlap=overlap),
+        df.DiffusionLevel(
+            freq_scale=8.0, residual_fraction=0.06, tile_size=tile_size, overlap=overlap
+        ),
+        df.DiffusionLevel(
+            freq_scale=18.0, residual_fraction=0.03, tile_size=tile_size, overlap=overlap
+        ),
     ]
 
 
@@ -690,9 +696,7 @@ def test_hierarchical_identity_and_determinism() -> None:
     first = df.refine_diffusion_hierarchical(tec, bt, **kwargs)
     second = df.refine_diffusion_hierarchical(tec, bt, **kwargs)
 
-    np.testing.assert_allclose(
-        tec + sum(first.level_residuals), first.elevation, atol=1e-9
-    )
+    np.testing.assert_allclose(tec + sum(first.level_residuals), first.elevation, atol=1e-9)
     np.testing.assert_array_equal(first.elevation, second.elevation)
     assert first.report["n_levels"] == len(first.level_residuals)
 
@@ -724,7 +728,9 @@ def test_hierarchical_macro_layout_untouched() -> None:
     """
     nlat, nlon = 24, 48
     tec = _tectonic(nlat, nlon)
-    tec[nlat // 2, :] = 0.0  # 显式构造一条岸线（同 test_refine_diffusion_coastline_pinned_to_sea_level）
+    tec[nlat // 2, :] = (
+        0.0  # 显式构造一条岸线（同 test_refine_diffusion_coastline_pinned_to_sea_level）
+    )
     bt = _boundary_types(nlat, nlon)
     block = 4
     result = df.refine_diffusion_hierarchical(tec, bt, seed=7, block=block, levels=_levels())
@@ -772,3 +778,80 @@ def test_hierarchical_conditions_cache_reuse(tmp_path) -> None:
     )
     plain = df.refine_diffusion_hierarchical(tec, bt, seed=9, block=4, levels=levels)
     np.testing.assert_allclose(cached.elevation, plain.elevation, atol=1e-12)
+
+
+# ===== 行为 6b：模型布局探测与镜像指引（P1-5，离线可测） =====
+
+
+def _tile_conditions(nlat: int = 8, nlon: int = 16) -> df.TileConditions:
+    tec = _tectonic(nlat, nlon, seed=1)
+    channels = df.build_condition_channels(tec, _boundary_types(nlat, nlon), block=4)
+    return df.TileConditions.from_global(
+        df.Tile(0, nlat, 0, nlon), tec, channels, _sphere_coords(nlat, nlon, scale=4.0)
+    )
+
+
+def test_refiner_reports_non_standard_layout_actionably(monkeypatch) -> None:
+    """非标准布局（无 model_index.json）必须给出可操作说明，而非含糊的 from_pretrained 报错。
+
+    Terrain Diffusion 系列（xandergos/terrain-diffusion-*）真实存在且镜像可下载，但布局
+    不是 diffusers 标准布局，无法用 DiffusionPipeline.from_pretrained 加载。用 monkeypatch
+    模拟该布局（离线可测），断言报错指出了原因与出路。
+    """
+    pytest.importorskip("huggingface_hub")
+    from huggingface_hub.errors import EntryNotFoundError
+
+    monkeypatch.setattr(
+        "huggingface_hub.hf_hub_download",
+        lambda *a, **k: (_ for _ in ()).throw(EntryNotFoundError("no model_index.json")),
+    )
+    refiner = df.TerrainDiffusionRefiner(model_id="xandergos/terrain-diffusion-90m")
+    with pytest.raises(RuntimeError) as excinfo:
+        refiner.refine_tile(_tile_conditions(), seed=0)
+
+    message = str(excinfo.value)
+    assert "不是标准 diffusers 布局" in message, message
+    assert "StructuredDiffusionRefiner" in message, "应给出可用的替代方案"
+    assert "xandergos/terrain-diffusion" in message, "应给出上游接入路径"
+
+
+def test_refiner_layout_probe_distinguishes_network_failure(monkeypatch) -> None:
+    """网络类失败不得被误报为"布局不对"，且应带上镜像指引。"""
+    pytest.importorskip("huggingface_hub")
+
+    monkeypatch.setattr(
+        "huggingface_hub.hf_hub_download",
+        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("unreachable")),
+    )
+    refiner = df.TerrainDiffusionRefiner(model_id="xandergos/terrain-diffusion-90m")
+    with pytest.raises(RuntimeError) as excinfo:
+        refiner.refine_tile(_tile_conditions(), seed=0)
+
+    message = str(excinfo.value)
+    assert "非布局问题" in message, message
+    assert df.HF_MIRROR_ENDPOINT in message, "网络失败时应提示镜像端点"
+
+
+def test_refiner_layout_probe_passes_for_standard_layout(monkeypatch) -> None:
+    """标准布局（有 model_index.json）不应被布局探测拦下。"""
+    pytest.importorskip("huggingface_hub")
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda *a, **k: "/tmp/model_index.json")
+    refiner = df.TerrainDiffusionRefiner(model_id="some/standard-model")
+    # 布局探测通过后才会走到真正的权重加载；此处断言探测本身不抛错
+    refiner._require_standard_layout()
+
+
+def test_cache_path_error_mentions_mirror() -> None:
+    """allow_download=False 的报错也应带镜像指引，便于离线环境排障。"""
+    refiner = df.TerrainDiffusionRefiner(model_id="some/model", allow_download=False)
+    with pytest.raises(RuntimeError) as excinfo:
+        refiner.refine_tile(_tile_conditions(), seed=0)
+    assert df.HF_MIRROR_ENDPOINT in str(excinfo.value)
+
+
+def test_mirror_constants_are_exported() -> None:
+    """镜像端点与布局说明应作为公开常量导出（供 CLI/文档引用）。"""
+    assert df.HF_MIRROR_ENDPOINT.startswith("https://")
+    assert df.TERRAIN_DIFFUSION_LAYOUT_HINT
+    assert df.HF_MIRROR_ENDPOINT in df.HF_MIRROR_HINT

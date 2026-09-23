@@ -55,6 +55,25 @@ COASTLINE_EPS = 1.0
 COORDS_SCALE = 6.0
 #: 河流阈值占网格单元的比例（未显式指定时的默认值）
 RIVER_FRACTION = 0.02
+#: Hugging Face 镜像端点（中国大陆直连 huggingface.co 不可达时使用）。
+#: 用法：``export HF_ENDPOINT=https://hf-mirror.com``（huggingface_hub 会遵循该变量）。
+#: 实测：顶层文件可经镜像正常下载；仓库**子目录**文件在镜像上不受 /api/resolve-cache
+#: 支持，需改用直链 ``<endpoint>/<repo>/resolve/main/<path>``。
+HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
+
+#: Terrain Diffusion 系列模型的仓库布局说明（见 :func:`TerrainDiffusionRefiner._require_standard_layout`）
+TERRAIN_DIFFUSION_LAYOUT_HINT = (
+    "该模型族不是标准 diffusers 布局：仓库以 config.json 的 _class_name（如 WorldPipeline）"
+    "描述上游自带的一套自定义推理栈（world_pipeline.py 约 64 KB、约 38 个依赖，含 infinite-tensor、"
+    "earthengine-api、wandb 等），因此 diffusers 的 DiffusionPipeline.from_pretrained 无法加载。"
+    "可选做法：① 改用内置 StructuredDiffusionRefiner（无需外部模型）；"
+    "② 按上游方式接入真实模型——git clone https://github.com/xandergos/terrain-diffusion ，"
+    "再 pip install -r requirements.txt，随后用 python -m terrain_diffusion explore <模型> "
+    "或 python -m terrain_diffusion api <模型>；注意上游 README 明确说明 Mac 仅支持 CPU。"
+)
+
+#: 下载权重时的镜像提示
+HF_MIRROR_HINT = f"若 huggingface.co 不可达，可设 HF_ENDPOINT={HF_MIRROR_ENDPOINT} 走镜像"
 #: 分层堆叠中单层残差的默认幅度 = fraction × std(上一层地形)（§3.4）
 LEVEL_RESIDUAL_FRACTION = 0.06
 
@@ -285,7 +304,10 @@ def _load_conditions(path: Path) -> ConditionChannels | None:
     import zarr
 
     group: Any = zarr.open_group(str(path), mode="r")
-    if any(name not in group for name in ("lowpass", "land_mask", "boundary_distance", "river_network", "kernel_map")):
+    if any(
+        name not in group
+        for name in ("lowpass", "land_mask", "boundary_distance", "river_network", "kernel_map")
+    ):
         return None
     return ConditionChannels(
         lowpass=np.asarray(group["lowpass"][:], dtype=np.float64),
@@ -715,14 +737,41 @@ class TerrainDiffusionRefiner:
         if not self.allow_download:
             raise RuntimeError(
                 f"扩散模型 {self.model_id} 未在本地缓存，且 allow_download=False；"
-                f"请先在线下载权重，或改用 StructuredDiffusionRefiner"
+                f"请先在线下载权重，或改用 StructuredDiffusionRefiner。（{HF_MIRROR_HINT}）"
             )
+        self._require_standard_layout()
         device = self.device or ("mps" if torch.backends.mps.is_available() else "cpu")
         pipe = DiffusionPipeline.from_pretrained(  # type: ignore[no-untyped-call]
             self.model_id, torch_dtype=getattr(torch, self.dtype)
         )
         self._pipeline = pipe.to(device)
         return self._pipeline
+
+    def _require_standard_layout(self) -> None:
+        """确认仓库是标准 diffusers 布局（含 ``model_index.json``）。
+
+        ``DiffusionPipeline.from_pretrained`` 要求仓库根有 ``model_index.json``；Terrain
+        Diffusion 系列（``xandergos/terrain-diffusion-*``）没有该文件，其根 ``config.json``
+        用的是 ``_class_name: WorldPipeline`` 这类**自定义**类名。若不做这层检查，用户只会
+        收到含糊的 "does not appear to have a file named model_index.json"，无从判断是网络、
+        是版本、还是模型本身不可用。这里把它换成可操作的说明。
+
+        只有确实存在该文件时才继续；网络类错误原样抛出（附镜像提示），不误报为布局问题。
+        """
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import EntryNotFoundError
+
+        try:
+            hf_hub_download(self.model_id, "model_index.json")
+        except EntryNotFoundError as exc:
+            raise RuntimeError(
+                f"扩散模型 {self.model_id} 无法直接加载。{TERRAIN_DIFFUSION_LAYOUT_HINT}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 网络/鉴权类失败需保留原始原因
+            raise RuntimeError(
+                f"扩散模型 {self.model_id} 的布局探测失败（非布局问题）："
+                f"{type(exc).__name__}: {exc}。（{HF_MIRROR_HINT}）"
+            ) from exc
 
     def refine_tile(self, conditions: TileConditions, seed: int) -> np.ndarray:
         """以条件通道为条件输入做去噪，返回残差 tile（§3.2、§3.3、§5.2）。
