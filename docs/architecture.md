@@ -32,10 +32,37 @@ src/virtual_world/
 - **后端透明**：`core.backend` 统一 MLX/NumPy，默认 Float32。
 - **分级分辨率**：`configs/resolution_levels.yaml` 定义 10°~0.25° 六级。
 
+## 球面网格（方案《地形生成混合方案》§1.5）
+
+三种网格在 `GridState` 中**对等可用**，字段水平形状由 `grid_type` 决定：
+
+| `grid_type` | 水平形状 | 几何模块 | 单元面积比 | 特点 |
+|-------------|----------|----------|-----------|------|
+| `latlon` | `(nlat, nlon)` | `core.spherical` | ∞（高纬收缩） | 解析度规、最简单的 IO 与出图 |
+| `cubed_sphere` | `(6, n_side, n_side)` | `core.cubed_sphere` | ≈1.5 | 无极点奇点，推荐用于地形生成 |
+| `healpix` | `(npix,)` | `core.healpix` | 1（严格等面积） | 层次化嵌套，天然多分辨率 |
+
+统一接口由 `core.geometry`（`GridGeometry`）提供，因此下游阶段只需换网格类型，不必改代码：
+
+- **单元面积与统计**：`cell_area` / `total_area` / `global_mean` / `global_integral` / `zonal_mean`（面积加权）
+- **微分算子**：`gradient` / `divergence` / `vorticity` / `laplacian`
+  （等经纬度用解析度规中心差分；立方球与 HEALPix 用 `core.operators` 的切平面最小二乘重建 +
+  平行移动，后者同时提供局地线性插值）
+- **多分辨率**：`coarsen`（限制算子，保守，全球加权平均严格不变）
+- **跨网格重网格**：`GridState.regrid(grid_type, ...)`，经纬网格作为桥梁，
+  分类/布尔场自动取最近邻
+- **拓扑**：立方球 `edge_neighbors/all_neighbors/shift`；HEALPix `edge_neighbors/all_neighbors`
+  （共角计数判定，含极点像素少一个对角邻居的处理）
+
+命令行可用 `--grid {latlon,cubed_sphere,healpix}` 选择网格；`healpix` 的 `nside` 必须是
+2 的幂（层次化与 LOD 的前提）。
+
 ## 运行
 
 ```bash
 python -m virtual_world.cli generate -p earth -r 2 -s 42
+python -m virtual_world.cli generate -p earth -r 5 --grid healpix
+python -m virtual_world.cli generate -p earth -r 5 --grid cubed_sphere
 python scripts/batch_generate.py -n 4
 python scripts/validate_world.py
 python scripts/benchmark.py

@@ -8,6 +8,7 @@ import pytest
 from virtual_world.core import backend
 from virtual_world.core.grid import (
     FIELDS,
+    FieldSpec,
     GridState,
     get_resolution_level,
     group_fields,
@@ -49,8 +50,10 @@ def test_resolution_must_match_shape() -> None:
         GridState(nlat=90, nlon=360, resolution=2.0)
 
 
-def test_unsupported_grid_type() -> None:
-    with pytest.raises(NotImplementedError):
+def test_unknown_grid_type_is_rejected() -> None:
+    with pytest.raises(NotImplementedError, match="grid_type"):
+        GridState(nlat=90, nlon=180, resolution=2.0, grid_type="healpix2")
+    with pytest.raises(ValueError, match="n_side"):
         GridState(nlat=90, nlon=180, resolution=2.0, grid_type="cubed_sphere")
 
 
@@ -75,10 +78,20 @@ def test_field_specs() -> None:
     assert FIELDS["elevation"].unit == "m"
     assert FIELDS["is_ocean"].dtype == "bool"
     assert FIELDS["T_soil"].dims == ("depth", "lat", "lon")
-    assert FIELDS["elevation"].expected_shape(90, 180) == (90, 180)
+    # 水平维按网格自身的形状展开：经纬 (90, 180)、立方球 (6, 16, 16)、HEALPix (npix,)
+    assert FIELDS["elevation"].expected_shape((90, 180)) == (90, 180)
+    assert FIELDS["elevation"].expected_shape((6, 16, 16)) == (6, 16, 16)
+    assert FIELDS["elevation"].expected_shape((12288,)) == (12288,)
+    assert FIELDS["T_soil"].expected_shape((90, 180), nz=6) == (6, 90, 180)
     assert "elevation" in group_fields("terrain")
     assert "T_jan" in group_fields("temperature")
     assert GridState.field_names() == list(FIELDS)
+
+
+def test_field_spec_rejects_broken_dims() -> None:
+    broken = FieldSpec(name="x", unit="-", group="test", dims=("lat",))
+    with pytest.raises(ValueError, match="水平维必须成对出现"):
+        broken.expected_shape((10, 10))
 
 
 # ===== 字段读写与校验 =====
@@ -294,3 +307,239 @@ def test_summary_and_nbytes(grid: GridState) -> None:
     assert summary["planet"] == "earth"
     assert summary["nbytes"] == 90 * 180 * 4  # 统一为 float32
     assert grid.nbytes == 90 * 180 * 4
+
+
+# ===== 三种网格对等（方案《地形生成混合方案》§1.5） =====
+
+
+@pytest.fixture
+def cubed(backend_name: str) -> GridState:
+    """立方球网格状态（12 度的等效分辨率，1536 单元）。"""
+    return GridState.from_cubed_sphere(16, planet=EARTH, seed=11, backend_name=backend_name)
+
+
+@pytest.fixture
+def healpix(backend_name: str) -> GridState:
+    """HEALPix 网格状态（nside=16，3072 单元）。"""
+    return GridState.from_healpix(16, planet=EARTH, seed=11, backend_name=backend_name)
+
+
+def _fill(state: GridState) -> GridState:
+    """用解析的 ``sin(lat)`` 场填充状态（三种网格通用）。"""
+    lat, _ = state.cell_latlon
+    state.set("T_annual", (np.sin(np.deg2rad(lat)) * 30.0).reshape(state.shape))
+    state.set("climate_code", np.abs(np.rint(np.sin(np.deg2rad(lat)) * 10)).astype(np.int64).reshape(state.shape))
+    return state
+
+
+@pytest.mark.parametrize(
+    "grid_type,shape,size",
+    [
+        ("cubed_sphere", (6, 16, 16), 1536),
+        ("healpix", (3072,), 3072),
+    ],
+)
+def test_non_latlon_geometry(grid_type: str, shape: tuple[int, ...], size: int) -> None:
+    state = (
+        GridState.from_cubed_sphere(16, planet=EARTH)
+        if grid_type == "cubed_sphere"
+        else GridState.from_healpix(16, planet=EARTH)
+    )
+    assert state.grid_type == grid_type
+    assert state.shape == shape
+    assert state.size == size
+    assert state.is_global
+    assert state.total_area == pytest.approx(4 * np.pi * EARTH.radius**2, rel=1e-12)
+    assert backend.to_numpy(state.cell_area).shape == shape
+    lat, lon = state.cell_latlon
+    assert lat.shape == (size,) and lon.shape == (size,)
+    assert state.validate() == []
+    # 经纬网格专属属性对这些网格不再有意义
+    assert state.lat is None and state.lat_edges is None and state.cos_lat is None
+    with pytest.raises(NotImplementedError, match="切片"):
+        state.slice_region(-10, 10, -30, 30)
+    with pytest.raises(NotImplementedError, match="resample"):
+        state.resample(45, 90)
+    with pytest.raises(NotImplementedError, match="cell_index"):
+        state.nearest_index(0.0, 0.0)
+
+
+def test_non_latlon_field_validation(cubed: GridState) -> None:
+    cubed.set("T_annual", np.zeros(cubed.shape))
+    with pytest.raises(ValueError, match="形状"):
+        cubed.set("T_annual", np.zeros((90, 180)))
+    with pytest.raises(ValueError, match="值 >"):
+        cubed.set("T_annual", np.full(cubed.shape, 1.0e5))
+    assert cubed.as_numpy("T_annual").shape == cubed.shape
+
+
+@pytest.mark.parametrize("grid_type", ["cubed_sphere", "healpix"])
+def test_non_latlon_statistics_and_lookup(grid_type: str, backend_name: str) -> None:
+    """面积加权统计与最近单元查找（三种网格通用语义）。"""
+    state = GridState.from_resolution(5.0, planet=EARTH, grid_type=grid_type, backend_name=backend_name)
+    _fill(state)
+    assert state.global_mean("T_annual") == pytest.approx(0.0, abs=0.2)  # sin(lat) 的全球面积加权均值 ~ 0
+    assert state.global_integral("T_annual") == pytest.approx(
+        state.global_mean("T_annual") * state.total_area, rel=1e-9
+    )
+    profile = state.zonal_mean("T_annual", nbands=12)
+    assert profile.shape == (12,)
+    assert np.all(np.diff(profile) > 0.0)  # 随纬度单调递增
+    # 最近单元查找：格心处的查询应回到自身
+    lat, lon = state.cell_latlon
+    lat7, lon7 = float(np.asarray(lat)[7]), float(np.asarray(lon)[7])
+    index = state.cell_index(lat7, lon7)
+    assert 0 <= index < state.size
+    assert state.value_at("T_annual", lat7, lon7) == pytest.approx(
+        float(np.asarray(state.as_numpy("T_annual")).reshape(-1)[index]), abs=1e-6
+    )
+
+
+@pytest.mark.parametrize("grid_type", ["cubed_sphere", "healpix"])
+def test_non_latlon_coarsen_conserves_mean(grid_type: str, backend_name: str) -> None:
+    """限制算子：三种网格的粗化都严格守恒全球面积加权平均。"""
+    state = _fill(GridState.from_resolution(5.0, planet=EARTH, grid_type=grid_type, backend_name=backend_name))
+    coarse = state.coarsen(2)
+    assert coarse.grid_type == grid_type
+    assert coarse.size == state.size // 4
+    assert coarse.global_mean("T_annual") == pytest.approx(state.global_mean("T_annual"), abs=1e-9)
+    # 分类字段不产生新类别
+    codes_before = set(np.unique(state.as_numpy("climate_code")).tolist())
+    codes_after = set(np.unique(coarse.as_numpy("climate_code")).tolist())
+    assert codes_after <= codes_before
+    if grid_type == "healpix":
+        with pytest.raises(ValueError, match="2 的幂"):
+            state.coarsen(3)  # HEALPix 只在四叉树层次上对齐
+    else:
+        # 立方球的块在面内对齐，任意整除因子都合法
+        assert state.coarsen(3).size * 9 == state.size
+
+
+def test_healpix_coarsen_matches_hierarchy(healpix: GridState) -> None:
+    """HEALPix 粗化等于四叉树层次聚合：4p..4p+3 的均值。"""
+    values = np.arange(healpix.size, dtype=np.float64)
+    from virtual_world.core.healpix import HealpixGrid
+
+    grid = HealpixGrid(16)
+    manual = values.reshape(-1, 4).mean(axis=1)
+    np.testing.assert_allclose(grid.coarsen(values, 2), manual)
+
+
+@pytest.mark.parametrize(
+    "target,kwargs,shape",
+    [
+        ("latlon", {"nlat": 45, "nlon": 90}, (45, 90)),
+        ("cubed_sphere", {"n_side": 16}, (6, 16, 16)),
+        ("healpix", {"nside": 32}, (12288,)),
+    ],
+)
+def test_regrid_from_cubed_sphere(
+    cubed: GridState, target: str, kwargs: dict, shape: tuple[int, ...]
+) -> None:
+    """立方球 -> 三种目标网格：形状正确、全球均值守恒（误差在插值阶量级）。"""
+    _fill(cubed)
+    before = cubed.global_mean("T_annual")
+    converted = cubed.regrid(target, **kwargs)
+    assert converted.grid_type == target
+    assert converted.shape == shape
+    assert converted.global_mean("T_annual") == pytest.approx(before, abs=1.0)
+    assert set(np.unique(converted.as_numpy("climate_code")).tolist()) <= set(
+        np.unique(cubed.as_numpy("climate_code")).tolist()
+    )
+    assert converted.validate() == []
+
+
+def test_regrid_roundtrip_cubed_and_healpix(cubed: GridState, healpix: GridState) -> None:
+    """立方球 <-> HEALPix 往返（经经纬网格桥接），光滑场信息基本保真。"""
+    _fill(cubed)
+    healed = cubed.regrid("healpix", nside=64)
+    back = healed.regrid("cubed_sphere", n_side=16)
+    assert back.shape == cubed.shape
+    error = np.abs(back.as_numpy("T_annual") - cubed.as_numpy("T_annual"))
+    assert error.max() < 2.0  # 场幅值 30，往返误差应在插值阶量级
+    assert back.global_mean("T_annual") == pytest.approx(cubed.global_mean("T_annual"), abs=0.5)
+    # 反方向：HEALPix -> 立方球 -> HEALPix
+    _fill(healpix)
+    roundtrip = healpix.regrid("cubed_sphere", n_side=32).regrid("healpix", nside=16)
+    assert roundtrip.shape == healpix.shape
+    assert np.abs(roundtrip.as_numpy("T_annual") - healpix.as_numpy("T_annual")).max() < 2.0
+
+
+def test_regrid_latlon_to_non_latlon(grid: GridState) -> None:
+    """经纬 -> 立方球 / HEALPix（含分类字段的最近邻语义）。"""
+    _fill(grid)
+    for grid_type, kwargs, shape in (
+        ("cubed_sphere", {"n_side": 24}, (6, 24, 24)),
+        ("healpix", {"nside": 32}, (12288,)),
+    ):
+        converted = grid.regrid(grid_type, **kwargs)
+        assert converted.shape == shape
+        assert converted.global_mean("T_annual") == pytest.approx(
+            grid.global_mean("T_annual"), abs=1.0
+        )
+        assert set(np.unique(converted.as_numpy("climate_code")).tolist()) <= set(
+            np.unique(grid.as_numpy("climate_code")).tolist()
+        )
+
+
+@pytest.mark.parametrize("grid_type", ["cubed_sphere", "healpix"])
+def test_non_latlon_serialization_roundtrip(grid_type: str, backend_name: str) -> None:
+    state = _fill(
+        GridState.from_resolution(10.0, planet=EARTH, grid_type=grid_type, backend_name=backend_name)
+    )
+    payload = state.to_dict()
+    assert payload["grid"]["grid_type"] == grid_type
+    restored = GridState.from_dict(payload)
+    assert restored.grid_type == grid_type
+    assert restored.shape == state.shape
+    assert restored.resolution == pytest.approx(state.resolution)
+    np.testing.assert_allclose(
+        restored.as_numpy("T_annual"), state.as_numpy("T_annual"), atol=1e-3
+    )
+
+
+@pytest.mark.parametrize("grid_type", ["cubed_sphere", "healpix"])
+def test_non_latlon_operators(grid_type: str) -> None:
+    """微分算子在非结构网格上可用：z 场梯度、旋转场涡度、laplacian 全球积分 ~ 0。"""
+    radius = EARTH.radius
+    state = GridState.from_resolution(5.0, planet=EARTH, grid_type=grid_type)
+    lat_flat, _ = state.cell_latlon
+    z = np.sin(np.deg2rad(lat_flat))
+    cos_lat = np.sqrt(np.maximum(1.0 - z**2, 0.0))
+    state.set("T_annual", (z * 30.0).reshape(state.shape))
+    state.set("u_jan", (200.0 * cos_lat).reshape(state.shape))
+    state.set("v_jan", np.zeros(state.shape))
+
+    # 精度细节由 test_operators.py 负责；这里只验证 GridState 的三种网格调度可用
+    gx, gy = state.gradient("T_annual")
+    gy_flat = np.asarray(gy).reshape(-1)
+    assert np.abs(gy_flat / 30.0 * radius - cos_lat).max() < 1e-2
+    # 用 u = U cos(lat)（等价于以 U/R 为角速度的刚体旋转）检验涡度与散度
+    spin = 200.0 / radius
+    vorticity = np.asarray(state.vorticity("u_jan", "v_jan")).reshape(-1)
+    assert np.abs(vorticity - 2.0 * spin * z).max() / (2.0 * spin) < 5e-2
+    divergence = np.asarray(state.divergence("u_jan", "v_jan")).reshape(-1)
+    # 散度靠差分相消得到，相对误差比涡度大一档（收敛性见 test_operators.py）
+    assert np.abs(divergence).max() / spin < 0.1
+    # 拉普拉斯是二阶量：float32 存储下噪声被 1/h^2 放大，这里只验证量级与全球积分为 0
+    laplacian = np.asarray(state.laplacian("T_annual")).reshape(-1)
+    expected = -2.0 * z * 30.0 / radius**2
+    assert np.abs(laplacian - expected).max() < 0.35 * np.abs(expected).max()
+    integral = abs(float(np.sum(laplacian * state._area_flat()))) / state.total_area
+    assert integral < 0.05 * np.abs(expected).max()
+
+
+def test_from_resolution_derives_non_latlon_sizes() -> None:
+    """按分辨率构造非经纬网格：立方球取 90/res，HEALPix 取最近的 2 的幂。"""
+    cubed = GridState.from_resolution(5.0, grid_type="cubed_sphere")
+    assert cubed.n_side == 18 and cubed.shape == (6, 18, 18)
+    healpix = GridState.from_resolution(5.0, grid_type="healpix")
+    assert healpix.nside == 16 and healpix.shape == (3072,)
+    from virtual_world.core.healpix import HealpixGrid
+
+    assert abs(healpix.resolution - HealpixGrid(16).resolution) < 1e-9
+    # 分级分辨率按"最接近的 2 的幂"换算（5° 对应 nside=11.7 → 16）
+    level = GridState.from_level("coarse", grid_type="healpix")
+    assert level.nside == 16
+    with pytest.raises(ValueError, match="网格类型"):
+        GridState.from_resolution(5.0, grid_type="nope")

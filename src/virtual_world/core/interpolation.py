@@ -60,14 +60,21 @@ def _bilinear_2d(
     j_hi: np.ndarray,
     wj: np.ndarray,
 ) -> np.ndarray:
-    """双线性插值核心（``i/j`` 索引为与目标同形的整数网格）。"""
+    """双线性插值核心（``i/j`` 索引为与目标同形的整数网格）。
+
+    权重需按``values``的维度显式对齐：纬度权重为列向量 ``(..., nlat_out, 1)``、
+    经度权重为行向量 ``(..., nlon_out)``，否则超过二维的输入会广播失败。
+    """
     v00 = values[..., i_lo, :][..., :, j_lo]
     v01 = values[..., i_lo, :][..., :, j_hi]
     v10 = values[..., i_hi, :][..., :, j_lo]
     v11 = values[..., i_hi, :][..., :, j_hi]
-    top = v00 * (1.0 - wj) + v01 * wj
-    bottom = v10 * (1.0 - wj) + v11 * wj
-    return top * (1.0 - wi) + bottom * wi
+    lead = (1,) * (values.ndim - 2)
+    wi_col = wi.reshape(*lead, -1, 1)
+    wj_row = wj.reshape(*lead, -1)
+    top = v00 * (1.0 - wj_row) + v01 * wj_row
+    bottom = v10 * (1.0 - wj_row) + v11 * wj_row
+    return top * (1.0 - wi_col) + bottom * wi_col
 
 
 def regrid(

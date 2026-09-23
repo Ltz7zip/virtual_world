@@ -31,6 +31,12 @@ def _add_generate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-l", "--level", default="medium", help="分级分辨率名：preview/coarse/medium/fine/high/ultra")
     parser.add_argument("-s", "--seed", type=int, default=0, help="世界种子（默认 0）")
     parser.add_argument("--backend", default="auto", choices=["auto", "mlx", "numpy"], help="数组后端")
+    parser.add_argument(
+        "--grid",
+        default="latlon",
+        choices=["latlon", "cubed_sphere", "healpix"],
+        help="网格类型（方案《地形生成混合方案》§1.5）",
+    )
     parser.add_argument("--json", action="store_true", help="以 JSON 输出概览")
 
 
@@ -42,7 +48,9 @@ def cmd_presets(args: argparse.Namespace) -> int:
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
-    config = RuntimeConfig(seed=args.seed, planet=_planet(args), backend=args.backend)
+    config = RuntimeConfig(
+        seed=args.seed, planet=_planet(args), backend=args.backend, grid_type=args.grid
+    )
     if args.resolution is not None:
         config.resolution = args.resolution
     else:
@@ -73,6 +81,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         planet=PlanetParams.from_preset(args.planet),
         seed=args.seed,
         backend_name=args.backend,
+        grid_type=args.grid,
     )
     problems = state.validate()
     if problems:

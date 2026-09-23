@@ -82,6 +82,25 @@ def total_area(lat_edges_deg: np.ndarray, radius: float) -> float:
     return float(np.sum(ring_areas(lat_edges_deg, radius)))
 
 
+def cell_spacing(lat_deg: np.ndarray, nlon: int, radius: float) -> tuple[float, np.ndarray]:
+    """网格间距 (m)：(纬向格距, 每行经向格距)，形状 ``(nlat,)``。
+
+    ``dlat = 180/nlat``、``dlon = 360/nlon`` 为角度格距（deg）。经线向极点收敛，
+    因此经向格距随 ``cos(lat)`` 收缩——这是经纬网格上坡度、扩散与水量守恒
+    必须使用度规距离（而非"格数"）的原因。
+
+    面积为局部小角度近似 ``dlat_m * dlon_m ≈ cell_areas``（相对误差
+    ``O(dlat^2)``，1° 网格约 3e-7），二者量纲一致，可直接混用。
+    """
+    lat = np.asarray(lat_deg, dtype=np.float64)
+    nlat = lat.size
+    if nlat <= 0 or nlon <= 0:
+        raise ValueError("nlat 与 nlon 必须为正")
+    dlat_m = math.radians(180.0 / nlat) * radius
+    dlon_m = math.radians(360.0 / nlon) * radius * np.cos(DEG_TO_RAD * lat)
+    return dlat_m, np.asarray(dlon_m, dtype=np.float64)
+
+
 def global_mean(field: Any, area: Any) -> float:
     """面积加权全球平均。"""
     xp = backend.backend_of(field)
@@ -100,6 +119,40 @@ def zonal_mean(field: Any) -> Any:
     """纬向平均（对经度取平均，形状 (nlat,)）。"""
     xp = backend.backend_of(field)
     return xp.mean(field, axis=-1)
+
+
+def zonal_mean_bands(
+    field: Any, lat_deg: Any, area: Any, nbands: int
+) -> np.ndarray:
+    """按纬度条带做**面积加权**平均，返回长度 ``nbands`` 的剖面。
+
+    用于非结构网格（立方球 / HEALPix）——这类网格没有"每行同纬度"的天然分层，
+    因此按纬度区间分箱；等经纬网格上调用它与 :func:`zonal_mean` 数值一致
+    （格内面积相同，权重相消）。空条带返回 NaN。
+    """
+    values = backend.to_numpy(field)
+    lat = backend.to_numpy(lat_deg)
+    weights = backend.to_numpy(area)
+    nbands = int(nbands)
+    if nbands <= 0:
+        raise ValueError(f"nbands 必须为正，实际 {nbands}")
+    if values.shape[-1] != lat.size or weights.shape[-1] != lat.size:
+        raise ValueError("字段、纬度与面积的末维长度必须一致")
+
+    edges = np.linspace(-90.0, 90.0, nbands + 1)
+    band = np.clip(np.digitize(lat, edges) - 1, 0, nbands - 1)
+    flat = values.reshape(-1, lat.size)
+    weight_sum = np.bincount(band, weights=weights, minlength=nbands)
+    numerator = np.stack(
+        [
+            np.bincount(band, weights=flat[row] * weights, minlength=nbands)
+            for row in range(flat.shape[0])
+        ],
+        axis=0,
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        profile = numerator / np.where(weight_sum > 0.0, weight_sum, np.nan)
+    return np.asarray(profile.reshape(*values.shape[:-1], nbands), dtype=np.float64)
 
 
 def area_weighted_mean(field: Any, area: Any, axis: int = -1) -> Any:
@@ -165,6 +218,21 @@ def vorticity(u: Any, v: Any, lat_deg: np.ndarray, radius: float) -> Any:
     cos_2d = cos_phi.reshape(shape)
     term = meridional_gradient(u * cos_2d, radius)
     return (zonal_gradient(v, lat_deg, radius) - term) / cos_2d
+
+
+def gradient(field: Any, lat_deg: np.ndarray, radius: float) -> tuple[Any, Any]:
+    """标量场梯度 ``(df/dx, df/dy)``（东、北分量，1/m）。
+
+    与立方球 / HEALPix 网格上 :meth:`~virtual_world.core.operators.TangentStencil.gradient`
+    的返回值约定一致，便于跨网格统一调用。
+    """
+    return zonal_gradient(field, lat_deg, radius), meridional_gradient(field, radius)
+
+
+def laplacian(field: Any, lat_deg: np.ndarray, radius: float) -> Any:
+    """球面拉普拉斯算子 ``div(grad f)``（1/m^2）。"""
+    gx, gy = gradient(field, lat_deg, radius)
+    return divergence(gx, gy, lat_deg, radius)
 
 
 # ===== 坐标变换与距离 =====

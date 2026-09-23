@@ -56,6 +56,7 @@ class RuntimeConfig:
     seed: int = 0
     planet: PlanetParams = field(default_factory=PlanetParams)
     resolution: float = 2.0  # deg
+    grid_type: str = "latlon"  # latlon / cubed_sphere / healpix（方案 §1.5）
     backend: str = "auto"
     nz: int = 1
     output_dir: str = "data/output"
@@ -107,8 +108,12 @@ def create_world(config: RuntimeConfig) -> tuple[GridState, list[StageResult]]:
         seed=config.seed,
         backend_name=config.backend,
         nz=config.nz,
+        grid_type=config.grid_type,
     )
-    _log(config.verbose, f"网格初始化完成 {state.shape} @ {state.resolution}\u00b0")
+    _log(
+        config.verbose,
+        f"网格初始化完成 {state.grid_type} {state.shape} @ {state.resolution:.3f}\u00b0",
+    )
 
     results: list[StageResult] = []
     for stage in config.stages:
@@ -154,8 +159,8 @@ def world_summary(state: GridState, results: list[StageResult]) -> str:
     summary = state.summary()
     lines = [
         f"世界 #{summary['seed']}  行星={summary['planet']}  "
-        f"分辨率={summary['resolution']}° 后端={summary['backend']}",
-        f"网格: {summary['shape'][0]}×{summary['shape'][1]}  面积={summary['total_area_m2']:.3e} m²",
+        f"分辨率={summary['resolution']:.3f}° 后端={summary['backend']}",
+        f"网格: {summary['grid_type']}  {summary['shape']}  面积={summary['total_area_m2']:.3e} m²",
         f"已填充字段 {len(state.filled_fields())} 个: {', '.join(state.filled_fields()) or '无'}",
         "阶段:",
     ]

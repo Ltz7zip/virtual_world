@@ -53,6 +53,12 @@ levels:
 
 # 网格与数值默认值
 grid:
+  # 三种球面网格对等（方案《地形生成混合方案》§1.5）：
+  #   latlon       等经纬度（(nlat, nlon)）
+  #   cubed_sphere 立方球（(6, n_side, n_side)，n_side = 90/resolution）
+  #   healpix      HEALPix 等面积层次化（(npix,)，nside 取最接近的 2 的幂）
+  # 用 `python -m virtual_world.cli generate --grid cubed_sphere` 选择；
+  # 上表的 resolution/nlat/nlon 仅用于 latlon。
   type: latlon          # latlon / cubed_sphere / healpix
   dtype: float32        # GPU 路径统一 Float32
   lon_center: 0.0       # 经度中心 (deg)，0 表示格林尼治
