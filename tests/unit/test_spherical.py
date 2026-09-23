@@ -5,7 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from virtual_world.core import backend, constants as const, spherical
+from virtual_world.core import backend, spherical
+from virtual_world.core import constants as const
 
 
 def test_lat_lon_centers_and_edges() -> None:
