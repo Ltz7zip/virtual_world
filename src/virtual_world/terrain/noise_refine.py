@@ -389,9 +389,9 @@ def select_noise_kernel(boundary_type: np.ndarray, elevation: np.ndarray) -> np.
 # ===== 残差构建与频域融合（核心原则） =====
 
 
-def _block_mean(field: np.ndarray, block: int) -> np.ndarray:
+def block_mean(field: np.ndarray, block: int) -> np.ndarray:
     """块均值降采样。非整数整除时按边缘填充到可整除尺寸，保证
-    :func:`_expand_tile` 可精确截断回原形状。"""
+    :func:`expand_tile` 可精确截断回原形状。"""
     nlat, nlon = field.shape
     bl = max(int(block), 1)
     pad_h = (-nlat) % bl
@@ -402,7 +402,7 @@ def _block_mean(field: np.ndarray, block: int) -> np.ndarray:
     return field.reshape(nl, bl, no, bl).mean(axis=(1, 3))
 
 
-def _expand_tile(coarse: np.ndarray, block: int, shape: tuple[int, int]) -> np.ndarray:
+def expand_tile(coarse: np.ndarray, block: int, shape: tuple[int, int]) -> np.ndarray:
     """将块均值场扩展回原分辨率（分块常数，作为低频分量近似）。"""
     return np.kron(coarse, np.ones((block, block)))[: shape[0], : shape[1]]
 
@@ -457,26 +457,9 @@ def build_kernel_fields(
     return np.asarray(base)
 
 
-# ===== 扩散精修接口（§3 残差学习策略） =====
-
-
-class DiffusionRefiner:
-    """扩散精修器协议（§3.3 残差学习）。
-
-    实现者接收构造场与条件通道（海陆掩码、边界距离场），返回**残差**场；
-    最终高程恒为 ``H_tectonic + H_residual``，因此实现只改变中高频细节，
-    不得改动低频骨架。
-    """
-
-    def refine(
-        self,
-        tectonic: np.ndarray,
-        land_mask: np.ndarray,
-        boundary_distance: np.ndarray,
-        seed: int,
-    ) -> np.ndarray:
-        """返回残差场（默认退化为零残差，由子类实现真实扩散采样）。"""
-        raise NotImplementedError("DiffusionRefiner.refine 需由子类实现")
+# ===== 扩散精修接口 =====
+# 扩散精修器协议、条件通道与约束强制归 :mod:`virtual_world.terrain.diffusion`
+# 所有；本模块只负责噪声基底与残差构建，是扩散层可选的降级路径（方案 §5.2）。
 
 
 @dataclasses.dataclass(frozen=True)
@@ -528,7 +511,6 @@ def refine_noise(
     warp_frequency: float = 0.5,
     residual_fraction: float = RESIDUAL_FRACTION,
     block: int = 4,
-    refiner: DiffusionRefiner | None = None,
 ) -> NoiseRefineResult:
     """第二层噪声精修完整管线（§7 伪代码 1–8）。
 
@@ -542,9 +524,11 @@ def refine_noise(
         warp_frequency: 扭曲场频率（低于主噪声频率）
         residual_fraction: 残差幅度 = fraction × std(H_tectonic)
         block: 块均值尺度（低频分离），用于保证残差不含低频能量
-        refiner: 可选扩散精修器（§3.3）；None 时用纯噪声残差
 
     返回 :class:`NoiseRefineResult`。确定性由 ``seed`` 保证。
+
+    需要扩散模型精修时用 :func:`virtual_world.terrain.diffusion.refine_diffusion`，
+    本函数是方案 §5.2 的纯噪声降级路径。
     """
     _check_seed(seed)
     tec = np.asarray(tectonic, dtype=np.float64)
@@ -569,18 +553,11 @@ def refine_noise(
     )
     base = base - base.mean()
 
-    # 6：残差（默认纯噪声路径）
-    if refiner is None:
-        low = _expand_tile(_block_mean(base, block), block, (nlat, nlon))
-        high = base - low  # 高通：去掉块尺度低频
-        std = float(high.std())
-        residual = high if std < 1e-12 else high / std * (residual_fraction * float(tec.std()))
-    else:
-        land_mask = tec > 0.0
-        bdist = boundary_distance_field(bt)
-        residual = np.asarray(refiner.refine(tec, land_mask, bdist, seed), dtype=np.float64)
-        if residual.shape != tec.shape:
-            raise ValueError(f"refiner 返回残差形状 {residual.shape} 与构造场 {tec.shape} 不一致")
+    # 6：残差（纯噪声路径，§5.2 降级）
+    low = expand_tile(block_mean(base, block), block, (nlat, nlon))
+    high = base - low  # 高通：去掉块尺度低频
+    std = float(high.std())
+    residual = high if std < 1e-12 else high / std * (residual_fraction * float(tec.std()))
 
     elevation = tec + residual
     return NoiseRefineResult(
@@ -616,15 +593,16 @@ def python_simplex_reference(
 
 
 __all__ = [
-    "DiffusionRefiner",
     "Kernel",
     "NoiseRefineResult",
     "PERSISTENCE",
     "LACUNARITY",
     "WARP_AMP",
     "RESIDUAL_FRACTION",
+    "block_mean",
     "boundary_distance_field",
     "build_kernel_fields",
+    "expand_tile",
     "fbm_noise",
     "python_simplex_reference",
     "refine_noise",

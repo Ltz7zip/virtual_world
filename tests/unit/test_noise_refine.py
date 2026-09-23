@@ -216,37 +216,7 @@ def test_refine_noise_non_divisible_block_shape() -> None:
     assert np.all(np.isfinite(out.elevation))
 
 
-# ===== 行为 6：扩散精修接口 =====
-
-
-def test_diffusion_refiner_protocol_residual_learning() -> None:
-    """残差学习：扩散精修输出的残差低频分量为零，叠加后不改构造格局。"""
-    nlat, nlon = 32, 64
-
-    class ConstDiffuser(nr.DiffusionRefiner):
-        """测试用伪扩散器：返回与构造场无关的常数残差。"""
-
-        def refine(
-            self,
-            tectonic: np.ndarray,
-            land_mask: np.ndarray,
-            boundary_distance: np.ndarray,
-            seed: int,
-        ) -> np.ndarray:
-            res = np.full_like(tectonic, 0.05)
-            res -= res.mean()
-            return res
-
-    x, y, z = _xyz_grid(nlat, nlon)
-    tectonic = 2000.0 * nr.simplex_noise(x, y, z, seed=71) * 2.0
-    btype = np.full((nlat, nlon), 2, dtype=np.int32)
-    out = nr.refine_noise(
-        tectonic, btype, seed=37, freq_scale=4.0, refiner=ConstDiffuser()
-    )
-    assert np.allclose(out.residual, 0.0, atol=1e-9)
-
-
-# ===== 行为 7：Numba 加速（正确性一致） =====
+# ===== 行为 6：Numba 加速（正确性一致） =====
 
 
 def test_numba_kernel_matches_python_reference() -> None:
